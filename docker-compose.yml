@@ -27,11 +27,22 @@ services:
     networks:
       - project_network
 
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    restart: always
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama    # 保存下載好的模型，避免每次重啟都要重新下載
+    networks:
+      - project_network
 
 volumes:
   pgdata:
   openwebui_data:
-  
+  ollama_data:
+
 networks:
   project_network:
     driver: bridge
