@@ -1,0 +1,36 @@
+# =============================================================================
+#  決定哪些檔案「不要」送進 docker build。
+#  跟 .gitignore 寫法一樣但用途不同：這裡影響的是 COPY . . 會複製什麼。
+# =============================================================================
+
+# 最重要的一條：本機的 node_modules 是 Windows 上裝的，
+# 裡面可能有平台專屬的二進位檔，複製進 Linux 容器會直接壞掉。
+# 容器內一律由 npm ci 重新安裝。
+node_modules
+
+# 本機的建置產物，容器內會自己重新 build
+.next
+out
+build
+*.tsbuildinfo
+
+# 機密：.env 系列絕對不可以進 image
+# (image 是可以被別人下載、解開來看的)
+.env
+.env.*
+
+# 版控與說明文件，執行時用不到
+.git
+.gitignore
+*.md
+
+# Docker 自身
+Dockerfile
+.dockerignore
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+npm-debug.log*
