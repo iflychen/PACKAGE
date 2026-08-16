@@ -15,7 +15,15 @@ services:
       - pgdata:/var/lib/postgresql   # PostgreSQL 18+ 用這個路徑(不是 /var/lib/postgresql/data)
     networks:
       - project_network
-  
+    # dashboard 靠這個判斷資料庫可以接了才啟動。
+    # 沒有 healthcheck 的話 depends_on 只等「容器被建立」，不等「資料庫 ready」，
+    # Next.js 會比 PostgreSQL 早十幾秒起來，第一次開頁面就是連線錯誤。
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d REALDB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   openwebui:
     image: ghcr.io/open-webui/open-webui:main
     container_name: open-webui
@@ -38,10 +46,86 @@ services:
     networks:
       - project_network
 
+  # ---------------------------------------------------------------------------
+  #  SPC 儀表板（前端）
+  #  ---------------------------------------------------------------------------
+  #  對外用 3001，因為 3000 已經給 openwebui 了。容器內部仍是 3000，不用改。
+  # ---------------------------------------------------------------------------
+  dashboard:
+    build: ./dashboard
+    image: spc-dashboard:latest
+    container_name: spc_dashboard
+    restart: always
+    ports:
+      - "3001:3000"
+    environment:
+      # host 用服務名稱 postgres、port 用內部的 5432。
+      # 不是 localhost，也不是對外映射的 5431。
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@postgres:5432/REALDB
+      # 所有 SPC 統計判定都在 Python 那邊算，這個服務還沒加進來。
+      # 加進來之前 dashboard 開得起來，但畫不出管制圖。
+      SPC_API_BASE: http://spc-api:8000
+      SETTINGS_PASSWORD: ${SETTINGS_PASSWORD:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - project_network
+  # ---------------------------------------------------------------------------
+  #  組員 B：Aniki 文件辨識服務
+  # ---------------------------------------------------------------------------
+  pipelines:
+    build: ./pipelines
+    image: aniki-pipelines:latest
+    container_name: aniki_pipelines
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "postgresql://postgres:${DB_PASSWORD}@postgres:5432/REALDB"
+      ANIKI_API_KEY: "${ANIKI_API_KEY}"
+      OLLAMA_URL: "http://ollama:11434/api/chat"
+      VLM_MODEL: "qwen2.5vl:7b"
+      VLM_RECHECK_MODEL: "qwen2.5vl:7b"
+      OLLAMA_KEEP_ALIVE: "10m"
+      REVIEW_DB_PATH: "/app/data/review_tasks.db"
+    volumes:
+      - pipelines_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    networks:
+      - project_network
+
+  # ---------------------------------------------------------------------------
+  #  TODO: Python SPC service
+  #  ---------------------------------------------------------------------------
+  #  dashboard 硬相依這個服務，缺了管制圖與製程能力都出不來。
+  #  程式在 RealProject-main/，需要有人補上 Dockerfile 後把下面解除註解。
+  #  啟動指令務必用 --host 0.0.0.0，綁 127.0.0.1 的話別的容器連不進來。
+  #
+  #  OLLAMA_MODEL 預設值 qwen3.5:9b 在 Ollama 上不存在，一定要改成真的有的
+  #  model tag，否則 AI 摘要按下去會回 502。
+  # ---------------------------------------------------------------------------
+  # spc-api:
+  #   build: ./spc-api
+  #   container_name: spc_api
+  #   restart: always
+  #   environment:
+  #     OLLAMA_BASE_URL: http://ollama:11434
+  #     OLLAMA_MODEL: qwen2.5:7b
+  #   depends_on:
+  #     - ollama
+  #   networks:
+  #     - project_network
+
 volumes:
   pgdata:
   openwebui_data:
   ollama_data:
+  pipelines_data:
 
 networks:
   project_network:

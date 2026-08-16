@@ -1,0 +1,27 @@
+{
+  "name": "spc-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "iPQC + SPC 前端：選製程/尺寸顯示 I-MR 管制圖並標示異常點。前端只呼叫 Next.js API，Next.js 再呼叫 Python SPC service。",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "pg": "^8.23.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.12.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/pg": "^8.21.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "typescript": "^5.5.3"
+  }
+}

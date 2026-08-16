@@ -1,0 +1,15 @@
+.env
+.git
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/*
+!data/.gitkeep
+review_tasks.db
+all_pages_result.json
+debug_*/
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.webp
