@@ -1,4 +1,4 @@
-name: realdb-project
+name: real-project
 
 services:
   postgres:
