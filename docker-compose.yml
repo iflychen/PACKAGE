@@ -71,6 +71,33 @@ services:
         condition: service_healthy
     networks:
       - project_network
+  # ---------------------------------------------------------------------------
+  #  組員 B：Aniki 文件辨識服務
+  # ---------------------------------------------------------------------------
+  pipelines:
+    build: ./pipelines
+    image: aniki-pipelines:latest
+    container_name: aniki_pipelines
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "postgresql://postgres:${DB_PASSWORD}@postgres:5432/REALDB"
+      ANIKI_API_KEY: "${ANIKI_API_KEY}"
+      OLLAMA_URL: "http://ollama:11434/api/chat"
+      VLM_MODEL: "qwen2.5vl:7b"
+      VLM_RECHECK_MODEL: "qwen2.5vl:7b"
+      OLLAMA_KEEP_ALIVE: "10m"
+      REVIEW_DB_PATH: "/app/data/review_tasks.db"
+    volumes:
+      - pipelines_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    networks:
+      - project_network
 
   # ---------------------------------------------------------------------------
   #  TODO: Python SPC service
@@ -98,6 +125,7 @@ volumes:
   pgdata:
   openwebui_data:
   ollama_data:
+  pipelines_data:
 
 networks:
   project_network:
