@@ -15,10 +15,23 @@ services:
       - pgdata:/var/lib/postgresql   # PostgreSQL 18+ 用這個路徑(不是 /var/lib/postgresql/data)
     networks:
       - project_network
+  
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: always
+    ports:
+      - "3000:8080"                  # 跟你目前習慣的 port 對齊
+    volumes:
+      - openwebui_data:/app/backend/data   # 保存聊天紀錄、設定等資料
+    networks:
+      - project_network
+
 
 volumes:
   pgdata:
-
+  openwebui_data:
+  
 networks:
   project_network:
     driver: bridge
