@@ -7,7 +7,7 @@ services:
     restart: always
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: realdb
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: REALDB
     ports:
       - "5431:5432"              # 本機:容器，維持你習慣的 5431 對外
