@@ -42,6 +42,21 @@ PDF_DPI = 150
 # Aniki.py 所在的資料夾
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 原始檔案統一放在 PACKAGE/ipqc。
+# Docker 內的路徑由 ANIKI_INPUT_DIR 指定。
+DEFAULT_INPUT_DIR = os.path.join(
+    os.path.dirname(BASE_DIR),
+    "ipqc",
+)
+INPUT_DIR = os.path.abspath(
+    os.path.expanduser(
+        os.getenv(
+            "ANIKI_INPUT_DIR",
+            DEFAULT_INPUT_DIR,
+        )
+    )
+)
+
 # =========================
 # 2. LangGraph State
 # =========================
@@ -383,7 +398,7 @@ def build_graph():
 def resolve_file_path(file_name: str) -> str:
     """
     使用者只需要提供檔案名稱，
-    程式會自動到 Aniki.py 所在資料夾尋找檔案。
+    程式會自動到 PACKAGE/ipqc 資料夾尋找檔案。
     """
 
     file_name = file_name.strip()
@@ -395,12 +410,12 @@ def resolve_file_path(file_name: str) -> str:
     if os.path.basename(file_name) != file_name:
         raise ValueError("請只輸入檔案名稱，不要輸入完整路徑")
 
-    file_path = os.path.join(BASE_DIR, file_name)
+    file_path = os.path.join(INPUT_DIR, file_name)
 
     if not os.path.isfile(file_path):
         raise FileNotFoundError(
             f"在資料夾中找不到檔案：{file_name}\n"
-            f"搜尋位置：{BASE_DIR}"
+            f"搜尋位置：{INPUT_DIR}"
         )
 
     return file_path

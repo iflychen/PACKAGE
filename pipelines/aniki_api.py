@@ -34,11 +34,18 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
+load_dotenv(ENV_PATH, override=True)
+
 ANIKI_SCRIPT = BASE_DIR / "Aniki.py"
 RESULT_PATH = BASE_DIR / "all_pages_result.json"
-UPLOAD_DIR = BASE_DIR
-
-load_dotenv(ENV_PATH, override=True)
+DEFAULT_INPUT_DIR = BASE_DIR.parent / "ipqc"
+UPLOAD_DIR = Path(
+    os.getenv(
+        "ANIKI_INPUT_DIR",
+        str(DEFAULT_INPUT_DIR),
+    )
+).expanduser().resolve()
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 ANIKI_API_KEY = os.getenv(
     "ANIKI_API_KEY",
@@ -409,6 +416,10 @@ def health() -> dict[str, Any]:
         ),
         "api_key_configured": bool(
             ANIKI_API_KEY
+        ),
+        "input_dir": str(UPLOAD_DIR),
+        "input_dir_exists": (
+            UPLOAD_DIR.is_dir()
         ),
     }
 
