@@ -14,6 +14,7 @@ import sqlite3
 import sys
 import time
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,33 @@ def table_columns(
         f'PRAGMA table_info("{table}")'
     ).fetchall()
     return {str(row[1]) for row in rows}
+
+
+def table_column_types(
+    connection: sqlite3.Connection,
+    table: str,
+) -> dict[str, str]:
+    rows = connection.execute(
+        f'PRAGMA table_info("{table}")'
+    ).fetchall()
+    return {str(row[1]): str(row[2]).upper() for row in rows}
+
+
+def timestamp_for_column(column_type: str) -> int | str:
+    """Match the column's declared SQL affinity.
+
+    Open WebUI stores some timestamp columns as epoch integers
+    (INTEGER/BIGINT) and others as SQLite DATETIME text
+    (e.g. "2026-08-18 12:42:15"). Writing the wrong shape corrupts
+    the row: SQLAlchemy's DateTime processor calls
+    datetime.fromisoformat() on read, which raises TypeError on an
+    int and crashes Open WebUI on every subsequent startup.
+    """
+    if "INT" in column_type:
+        return int(time.time())
+    return datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
 def find_owner_id(
@@ -181,7 +209,8 @@ def install_default_model(
 ) -> None:
     """Support both current per-key and legacy JSON-blob config schemas."""
     columns = table_columns(connection, "config")
-    now = int(time.time())
+    column_types = table_column_types(connection, "config")
+    now = timestamp_for_column(column_types.get("updated_at", ""))
 
     if {"key", "value"}.issubset(columns):
         sql = (
