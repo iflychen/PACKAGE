@@ -41,6 +41,9 @@ FastAPI（aniki_api.py）
 ```env
 DB_PASSWORD=請設定本地PostgreSQL密碼
 ANIKI_API_KEY=請設定一組較長的英文數字
+# 選填；未設定時使用下列預設值
+VLM_MODEL=qwen2.5vl:7b
+SPC_OLLAMA_MODEL=qwen2.5:7b
 ```
 
 ### 2. 啟動Docker服務
@@ -57,31 +60,37 @@ docker compose up -d --build
 docker compose ps
 ```
 
-### 3. 第一次使用時還原資料庫
+### 3. 資料庫自動初始化
 
-只有全新 PostgreSQL 第一次需要執行。
+`database-init` 會在首次啟動時檢查 REALDB：
 
-Windows PowerShell：
+* 資料庫完全空白時，自動還原根目錄的 `REALDB_backup.dump`。
+* 已有必要資料表時直接略過，不會覆蓋既有資料。
+* 若已有部分資料表但結構不完整，初始化會停止並提示錯誤，不會自動清除資料。
 
-```powershell
-cmd /c "docker compose exec -T postgres pg_restore -U postgres -d REALDB --clean --if-exists --no-owner < REALDB_backup.dump"
-```
-
-如果資料庫中已經有正式資料，不要重複執行，以免覆蓋原有資料。
-
-### 4. 第一次使用時下載Ollama模型
+可用下列指令查看初始化紀錄：
 
 ```bash
-docker compose exec ollama ollama pull qwen2.5vl:7b
+docker compose logs database-init
 ```
 
-確認模型：
+### 4. 確認自動初始化完成
+
+Docker 啟動時會自動：
+
+* 下載 Aniki 所需的 `qwen2.5vl:7b` 視覺模型與 SPC 所需模型；已存在的模型不會重複下載。
+* 首次啟動時還原 REALDB 的必要資料表。
+* 將 `openwebui_aniki_pipe.py` 安裝或更新到 Open WebUI。
+* 啟用 Aniki，並把 `aniki` 設成新對話的預設模型。
+
+第一次啟動需等待模型下載完畢。可用下列指令確認模型與初始化紀錄：
 
 ```bash
 docker compose exec ollama ollama list
+docker compose logs aniki-openwebui-init
 ```
 
-### 5. 測試Pipelines服務
+### 5. 測試 Pipelines 服務
 
 健康檢查：
 
@@ -126,32 +135,15 @@ http://localhost:8000/docs
 
 其中 `neon_success` 為舊版欄位名稱，目前代表資料是否成功寫入本地 PostgreSQL。
 
-## Open WebUI設定
+## Open WebUI 使用方式
 
-第一次在新的 Open WebUI 環境使用時，需要手動匯入 Pipe。
+1. 開啟 `http://localhost:3000` 並登入。
+2. 開啟新對話；Docker 已將 Aniki 設為預設模型，不需要手動選擇。
+3. 上傳 PDF 或圖片並按送出；訊息內容可留空或任意填寫，不需要輸入特定辨識指令。
+4. 等待辨識結果與資料庫寫入結果。
+5. 若資料庫已有同名檔案，Aniki 會先詢問是否以新資料取代；確認後才會重新辨識及更新，取消則保留舊資料。若瀏覽器未顯示確認視窗，可直接回覆「取代」或「取消」。
 
-1. 開啟 `http://localhost:3000`
-2. 進入 `Workspace → Functions`
-3. 建立新的 Function
-4. 貼上 `openwebui_aniki_pipe.py`
-5. 儲存並啟用
-6. 在 Valves 設定：
-
-```text
-API_URL = http://pipelines:8000
-API_KEY = 與根目錄.env相同
-TIMEOUT_SECONDS = 7200
-DEFAULT_PAGES = 留空或填1
-```
-
-完成後回到聊天頁面：
-
-1. 選擇 Aniki 模型
-2. 上傳 PDF 或圖片
-3. 輸入「開始辨識」
-4. 等待辨識結果與資料庫寫入結果
-
-Open WebUI 的 Function、Valves、API Key 與聊天紀錄儲存在 `openwebui_data` Docker volume，不會自動跟著 GitHub 移動，因此新電腦第一次仍需匯入。
+`aniki-openwebui-init` 是可重複執行的初始化服務。每次 Docker 啟動都會確認 Aniki 已安裝、啟用並更新到專案內的版本；既有的聊天紀錄及手動調整過的 Valves 仍保存在 `openwebui_data` volume。
 
 ## 功能
 
@@ -202,6 +194,9 @@ pipelines/
 │
 ├─ openwebui_aniki_pipe.py
 │  └─ Open WebUI與FastAPI之間的連接程式
+│
+├─ openwebui_bootstrap.py
+│  └─ Docker啟動時自動安裝、啟用Aniki並設為預設模型
 │
 ├─ check_pdf_direction.py
 │  └─ 人工檢查PDF頁面方向的除錯工具

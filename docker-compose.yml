@@ -21,6 +21,23 @@ services:
       timeout: 3s
       retries: 10
 
+  # Restore the bundled schema/data only when REALDB is still empty.
+  database-init:
+    image: postgres:18
+    container_name: realdb_init
+    restart: on-failure
+    entrypoint: ["/bin/sh", "/opt/init-realdb.sh"]
+    environment:
+      PGPASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./REALDB_backup.dump:/backup/REALDB_backup.dump:ro
+      - ./init-realdb.sh:/opt/init-realdb.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - project_network
+
   openwebui:
     image: ghcr.io/open-webui/open-webui:main
     container_name: open-webui
@@ -29,6 +46,17 @@ services:
       - "3000:8080"
     volumes:
       - openwebui_data:/app/backend/data
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      ENABLE_PLUGINS: "true"
+      DEFAULT_MODELS: aniki
+      ANIKI_API_URL: http://pipelines:8000
+      ANIKI_API_KEY: ${ANIKI_API_KEY}
+    depends_on:
+      ollama-model-init:
+        condition: service_completed_successfully
+      pipelines:
+        condition: service_healthy
     networks:
       - project_network
 
@@ -40,6 +68,31 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      - project_network
+
+  # Pull required models once. Existing Ollama layers are reused on later starts.
+  ollama-model-init:
+    image: ollama/ollama
+    container_name: ollama_model_init
+    restart: on-failure
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        ollama pull "${VLM_MODEL:-qwen2.5vl:7b}" &&
+        ollama pull "${SPC_OLLAMA_MODEL:-qwen2.5:7b}"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      VLM_MODEL: ${VLM_MODEL:-qwen2.5vl:7b}
+      SPC_MODEL: ${SPC_OLLAMA_MODEL:-qwen2.5:7b}
+    depends_on:
+      ollama:
+        condition: service_healthy
     networks:
       - project_network
 
@@ -57,8 +110,8 @@ services:
       OLLAMA_BASE_URL: http://ollama:11434
       OLLAMA_MODEL: qwen2.5:7b
     depends_on:
-      ollama:
-        condition: service_started
+      ollama-model-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 30s
@@ -80,8 +133,8 @@ services:
       SPC_API_BASE: http://spc-api:8000
       SETTINGS_PASSWORD: ${SETTINGS_PASSWORD:-}
     depends_on:
-      postgres:
-        condition: service_healthy
+      database-init:
+        condition: service_completed_successfully
       spc-api:
         condition: service_healthy
     networks:
@@ -98,8 +151,8 @@ services:
       DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@postgres:5432/REALDB
       ANIKI_API_KEY: ${ANIKI_API_KEY}
       OLLAMA_URL: http://ollama:11434/api/chat
-      VLM_MODEL: qwen2.5vl:7b
-      VLM_RECHECK_MODEL: qwen2.5vl:7b
+      VLM_MODEL: ${VLM_MODEL:-qwen2.5vl:7b}
+      VLM_RECHECK_MODEL: ${VLM_MODEL:-qwen2.5vl:7b}
       OLLAMA_KEEP_ALIVE: 10m
       REVIEW_DB_PATH: /app/data/review_tasks.db
       ANIKI_INPUT_DIR: /app/ipqc
@@ -107,10 +160,30 @@ services:
       - pipelines_data:/app/data
       - ./ipqc:/app/ipqc
     depends_on:
-      postgres:
+      database-init:
+        condition: service_completed_successfully
+      ollama-model-init:
+        condition: service_completed_successfully
+    networks:
+      - project_network
+
+  # Open WebUI stores Functions in its database. This idempotent one-shot
+  # installer keeps Aniki present and active even with an existing data volume.
+  aniki-openwebui-init:
+    image: python:3.12-slim
+    container_name: aniki_openwebui_init
+    restart: on-failure
+    command: ["python", "/opt/aniki/openwebui_bootstrap.py"]
+    environment:
+      OPENWEBUI_DB_PATH: /app/backend/data/webui.db
+      ANIKI_PIPE_SOURCE: /opt/aniki/openwebui_aniki_pipe.py
+    volumes:
+      - openwebui_data:/app/backend/data
+      - ./pipelines/openwebui_bootstrap.py:/opt/aniki/openwebui_bootstrap.py:ro
+      - ./pipelines/openwebui_aniki_pipe.py:/opt/aniki/openwebui_aniki_pipe.py:ro
+    depends_on:
+      openwebui:
         condition: service_healthy
-      ollama:
-        condition: service_started
     networks:
       - project_network
 
