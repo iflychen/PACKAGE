@@ -23,6 +23,28 @@ import { DEFAULT_EVENT_TYPE } from "@/lib/types";
 
 const CHART_TYPES: ChartType[] = ["I-MR", "Xbar-R", "Xbar-S"];
 type ChartViewMode = "monitor" | "analysis";
+type MainView = "monitor" | "capability" | "history";
+
+interface ControlLimitVersion {
+  product: string;
+  process: string;
+  machine: string;
+  feature_name: string;
+  chart_type: ChartType;
+  cl: number | null;
+  ucl: number | null;
+  lcl: number | null;
+  mr_cl: number | null;
+  mr_ucl: number | null;
+  mr_lcl: number | null;
+  is_active: boolean;
+  started_at: string;
+  ended_at: string | null;
+  sample_size: number | null;
+  cp: number | null;
+  cpk: number | null;
+  ppk: number | null;
+}
 
 function chartTitles(t: ChartType): { top: string; bottom: string } {
   if (t === "Xbar-R") {
@@ -269,6 +291,16 @@ export default function Page() {
   const [intervalLoading, setIntervalLoading] = useState(false);
   const [intervalReady, setIntervalReady] = useState(false);
   const [chartViewMode, setChartViewMode] = useState<ChartViewMode>("monitor");
+  const [mainView, setMainView] = useState<MainView>("monitor");
+  const [aiDrawerOpen, setAiDrawerOpen] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportPreview, setReportPreview] = useState(false);
+  const [reportOptions, setReportOptions] = useState({
+    charts: true,
+    capability: true,
+    abnormal: true,
+    ai: false,
+  });
 
   // 設定
   const [minSamples, setMinSamplesState] = useState<number>(5);
@@ -305,6 +337,9 @@ export default function Page() {
   const [capLoading, setCapLoading] = useState(false);
   const [capError, setCapError] = useState<string | null>(null);
   const [capRevision, setCapRevision] = useState(0);
+  const [historyRows, setHistoryRows] = useState<ControlLimitVersion[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
 
   // AI 摘要
   const [aiSummary, setAiSummary] = useState<string | null>(null);
@@ -740,6 +775,40 @@ export default function Page() {
     capRevision,
   ]);
 
+  // 歷史版本只讀取既有「管制圖」紀錄；沒有保存的歷史量測 window 不推測重建。
+  useEffect(() => {
+    if (!selProduct || !selProcess || !selMachine || !selFeature) return;
+    const controller = new AbortController();
+    setHistoryLoading(true);
+    setHistoryError(null);
+    const url =
+      `/api/control-limit?product=${encodeURIComponent(selProduct)}` +
+      `&process=${encodeURIComponent(selProcess)}` +
+      `&machine=${encodeURIComponent(selMachine)}` +
+      `&feature=${encodeURIComponent(selFeature)}`;
+    fetch(url, { cache: "no-store", signal: controller.signal })
+      .then(async (response) => {
+        const payload = await response.json();
+        if (controller.signal.aborted) return;
+        if (!response.ok) {
+          setHistoryRows([]);
+          setHistoryError(payload.detail ?? payload.error ?? "歷史版本載入失敗");
+          return;
+        }
+        setHistoryRows((payload.rows ?? []) as ControlLimitVersion[]);
+      })
+      .catch((err) => {
+        if (!controller.signal.aborted) {
+          setHistoryRows([]);
+          setHistoryError(err instanceof Error ? err.message : String(err));
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setHistoryLoading(false);
+      });
+    return () => controller.abort();
+  }, [selProduct, selProcess, selMachine, selFeature, chartRevision]);
+
   // ────────────────────────────────────────────────────────
   // Phase I 試算 / 核准
   // ────────────────────────────────────────────────────────
@@ -1144,9 +1213,30 @@ export default function Page() {
     return result;
   }, [autoBatch.results]);
 
-  // active 狀態以 chart API 從 DB 查到的明確旗標為準；limits 僅保留舊 API 相容。
+  const selectedComboForStatus = featureOptions.find(
+    (item) => item.feature_name === selFeature,
+  );
+  const activeHistoryVersion = historyRows.find(
+    (row) =>
+      row.product.trim() === selProduct.trim() &&
+      row.process.trim() === selProcess.trim() &&
+      row.machine.trim() === selMachine.trim() &&
+      row.feature_name.trim() === selFeature.trim() &&
+      row.chart_type === selChartType &&
+      row.is_active,
+  );
+  const comboHasActiveForChart = Boolean(
+    selectedComboForStatus?.active_chart_types?.includes(selChartType) ??
+      (selectedComboForStatus?.has_active_control_limit &&
+        selectedComboForStatus.chart_type === selChartType),
+  );
+  // chart、版本 API、尺寸清單都來自 DB；任一回應確認完整 key active 就維持 Phase II。
+  // 特別是目前事件區間沒有量測點而 chart 回 404 時，不可錯退回 Phase I。
   const hasActiveLimit = Boolean(
-    data?.has_active_control_limit ?? data?.limits.cl != null,
+    data?.has_active_control_limit ||
+      data?.limits.cl != null ||
+      activeHistoryVersion ||
+      comboHasActiveForChart,
   );
   const activeInterval =
     eventIntervals.find((it) => it.interval_id === selInterval) ?? null;
@@ -1182,11 +1272,45 @@ export default function Page() {
     visibleData?.secondary_chart?.component_type ??
     (selChartType === "I-MR" ? "MR" : selChartType === "Xbar-R" ? "R" : "S");
 
+  const latestPoint = visibleData?.points.at(-1) ?? null;
+  const selectedCombo = selectedComboForStatus;
+  const currentPhase = hasActiveLimit ? "Phase II" : "Phase I";
+  const selectedTrialProblem = autoProblemByFeature.get(selFeature);
+  const selectedStatus =
+    stats.spec > 0 ? "超規" : stats.control > 0 ? "失控" : "正常";
+
+  const dimensionStatus = (feature: FeatureCombo) => {
+    const activeForCurrentChart =
+      feature.active_chart_types?.includes(selChartType) ??
+      (feature.has_active_control_limit && feature.chart_type === selChartType);
+    if (activeForCurrentChart) return "Active";
+    if (
+      feature.feature_name === selFeature &&
+      (trialData || selectedTrialProblem?.status === "needs_review")
+    ) {
+      return "Trial";
+    }
+    return "未啟用";
+  };
+
+  const toggleReportOption = (key: keyof typeof reportOptions) => {
+    setReportOptions((current) => ({ ...current, [key]: !current[key] }));
+  };
+
+  const printReport = () => {
+    setReportOpen(false);
+    setReportPreview(true);
+    window.setTimeout(() => window.print(), 80);
+  };
+
   return (
-    <div className="dash">
+    <div className={`dash view-${mainView} ${reportPreview ? "report-ready" : ""}`}>
       {/* ───────────── ① 灰 選擇 ───────────── */}
       <section className="box box-gray toolbar-box">
-        <span className="box-tag">① 選擇</span>
+        <div className="brand-mark" aria-label="SPC 製程監控">
+          <span className="brand-icon">◇</span>
+          <b>SPC 製程監控</b>
+        </div>
 
         <label className="mini-field">
           <span>品號</span>
@@ -1342,6 +1466,19 @@ export default function Page() {
         </span>
 
         <button
+          className="btn ghost toolbar-action"
+          onClick={() => setAiDrawerOpen(true)}
+        >
+          AI 摘要
+        </button>
+        <button
+          className="btn ghost toolbar-action"
+          onClick={() => setReportOpen(true)}
+        >
+          報表
+        </button>
+
+        <button
           className="gear"
           onClick={() => {
             setSettingsOpen(true);
@@ -1368,12 +1505,92 @@ export default function Page() {
       )}
       {approvalMessage && <div className="flash ok">{approvalMessage}</div>}
 
+      <section className="status-strip" aria-label="目前狀態摘要">
+        <article className={`status-card phase ${hasActiveLimit ? "active" : "trial"}`}>
+          <span className="status-label">目前狀態</span>
+          <strong>{currentPhase}</strong>
+          <small>{hasActiveLimit ? "正式監控中" : "建立基準中"}</small>
+        </article>
+        <article className={`status-card ${selectedStatus === "正常" ? "good" : "danger"}`}>
+          <span className="status-label">異常狀態</span>
+          <strong>{selectedStatus}</strong>
+          <small>失控 {stats.control} · 超規 {stats.spec}</small>
+        </article>
+        <article className={`status-card ${hasActiveLimit ? "active" : "muted-card"}`}>
+          <span className="status-label">管制界線</span>
+          <strong>{hasActiveLimit ? "Active" : trialData ? "Trial" : "尚未啟用"}</strong>
+          {hasActiveLimit ? (
+            <small className="limit-summary">
+              <span>UCL {fmt(data?.limits.ucl ?? activeHistoryVersion?.ucl)}</span>
+              <span>CL {fmt(data?.limits.cl ?? activeHistoryVersion?.cl)}</span>
+              <span>LCL {fmt(data?.limits.lcl ?? activeHistoryVersion?.lcl)}</span>
+            </small>
+          ) : (
+            <small>Phase I 暫估／規格判定</small>
+          )}
+        </article>
+        <article className="status-card latest">
+          <span className="status-label">最新量測</span>
+          <strong>{latestPoint ? fmt(latestPoint.value) : "—"}</strong>
+          <small>{latestPoint?.time ? fmtTime(latestPoint.time) : "尚無資料"}</small>
+        </article>
+        <article className="status-card sample">
+          <span className="status-label">樣本數</span>
+          <strong>{visibleData?.points.length ?? selectedCombo?.sample_size ?? 0}</strong>
+          <small>目前事件區間有效樣本</small>
+        </article>
+        <article className={`status-card capability ${isGood ? "good" : ""}`}>
+          <span className="status-label">能力概況{hasActiveLimit ? "" : "（暫估）"}</span>
+          <strong>Cpk {fmt(metrics?.cpk, 2)}</strong>
+          <small>Cp {fmt(metrics?.cp, 2)} · Ppk {fmt(metrics?.ppk, 2)}</small>
+        </article>
+      </section>
+
+      <div className="app-workspace">
+        <aside className="dimension-panel" aria-label="球標尺寸清單">
+          <div className="dimension-head">
+            <div>
+              <strong>尺寸清單</strong>
+              <small>{featureOptions.length} 個球標尺寸</small>
+            </div>
+          </div>
+          <div className="dimension-list">
+            {featureOptions.map((feature, index) => {
+              const status = dimensionStatus(feature);
+              const problem = autoProblemByFeature.get(feature.feature_name);
+              return (
+                <button
+                  key={feature.feature_name}
+                  type="button"
+                  className={`dimension-row ${feature.feature_name === selFeature ? "selected" : ""} ${problem ? `problem-${problem.status}` : ""}`}
+                  onClick={() => setSelFeature(feature.feature_name)}
+                  disabled={autoBatch.running}
+                  title={problem?.reason}
+                >
+                  <span className="dimension-index">{index + 1}</span>
+                  <span className="dimension-name">{feature.feature_name}</span>
+                  <span className="dimension-value">{fmt(feature.latest_value)}</span>
+                  <span className={`status-badge ${status.toLowerCase()}`}>{status}</span>
+                </button>
+              );
+            })}
+          </div>
+        </aside>
+
+        <main className="content-shell">
+          <nav className="main-tabs" aria-label="主功能">
+            <button className={mainView === "monitor" ? "active" : ""} onClick={() => setMainView("monitor")}>即時監控</button>
+            <button className={mainView === "capability" ? "active" : ""} onClick={() => setMainView("capability")}>製程能力</button>
+            <button className={mainView === "history" ? "active" : ""} onClick={() => setMainView("history")}>歷史版本</button>
+            <span className="tab-context">{selFeature} · {selChartType}</span>
+          </nav>
+
       <div className="dash-body">
         <div className="dash-main">
           {/* ───────────── ② 藍 製程能力 ───────────── */}
           <section className="box box-blue cap-box">
             <div className="box-head">
-              <span className="box-tag">② 製程能力</span>
+              <span className="box-tag">製程能力指標 {hasActiveLimit ? "" : "（Phase I 暫估）"}</span>
               {capLoading && <span className="tiny muted">計算中…</span>}
               {!capLoading && capError && (
                 <span className="tiny err-text">{capError}</span>
@@ -1576,7 +1793,7 @@ export default function Page() {
           {/* ───────────── ③ 綠 管制監控 ───────────── */}
           <section className="box box-green chart-box">
             <div className="box-head">
-              <span className="box-tag">③ 管制監控</span>
+              <span className="box-tag">管制圖監控</span>
               <div className="mode-toggle" aria-label="管制圖檢視模式">
                 <button
                   type="button"
@@ -1656,13 +1873,44 @@ export default function Page() {
               </div>
             )}
           </section>
+
+          <section className="box history-box">
+            <div className="box-head">
+              <span className="box-tag">管制界線版本</span>
+              {historyLoading && <span className="tiny muted">載入中…</span>}
+            </div>
+            {historyError && <div className="flash err">{historyError}</div>}
+            {!historyLoading && historyRows.length === 0 && !historyError && (
+              <div className="history-empty">此尺寸尚無管制界線版本。</div>
+            )}
+            {historyRows.length > 0 && (
+              <div className="history-table-wrap">
+                <table className="history-table">
+                  <thead><tr><th>版本起始</th><th>結束</th><th>圖型</th><th>狀態</th><th>UCL</th><th>CL</th><th>LCL</th><th>樣本</th><th>Cpk</th></tr></thead>
+                  <tbody>
+                    {historyRows.map((row) => (
+                      <tr key={`${row.chart_type}-${row.started_at}`}>
+                        <td>{fmtTime(row.started_at)}</td>
+                        <td>{fmtTime(row.ended_at)}</td>
+                        <td>{row.chart_type}</td>
+                        <td><span className={`status-badge ${row.is_active ? "active" : "closed"}`}>{row.is_active ? "Active" : "已結束"}</span></td>
+                        <td>{fmt(row.ucl)}</td><td>{fmt(row.cl)}</td><td>{fmt(row.lcl)}</td>
+                        <td>{row.sample_size ?? "—"}</td><td>{fmt(row.cpk, 2)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <p className="history-note">目前資料庫保存版本界線與能力值，未保存每個版本當時的完整量測 window，因此不推測繪製歷史曲線。</p>
+          </section>
         </div>
 
         <div className="dash-side">
           {/* ───────────── ④ 橘 異常判定 ───────────── */}
           <section className="box box-amber judge-box">
             <div className="box-head">
-              <span className="box-tag">④ 異常判定</span>
+              <span className="box-tag">異常判定</span>
             </div>
 
             <div className="stat-row">
@@ -1713,7 +1961,7 @@ export default function Page() {
           {/* ───────────── ⑤ 紫 決策 ───────────── */}
           <section className="box box-purple decide-box">
             <div className="box-head">
-              <span className="box-tag">⑤ 決策</span>
+              <span className="box-tag">決策 / 下一步</span>
               {hasActiveLimit && (
                 <span className="tiny muted">Phase II 監控中</span>
               )}
@@ -1887,6 +2135,65 @@ export default function Page() {
           </section>
         </div>
       </div>
+        </main>
+      </div>
+
+      {aiDrawerOpen && (
+        <div className="drawer-mask" onClick={() => setAiDrawerOpen(false)}>
+          <aside className="ai-drawer" onClick={(event) => event.stopPropagation()} aria-label="AI 品質摘要">
+            <div className="drawer-head">
+              <div><small>決策輔助</small><h2>AI 品質摘要</h2></div>
+              <button className="modal-x" onClick={() => setAiDrawerOpen(false)} aria-label="關閉">×</button>
+            </div>
+            <div className="drawer-context">
+              <b>{selFeature}</b>
+              <span>{selProduct} · {selProcess} · {selMachine} · {selChartType}</span>
+              <span>{currentPhase} · {selectedStatus} · Cpk {fmt(metrics?.cpk, 2)}</span>
+            </div>
+            <button className="btn primary drawer-generate" onClick={() => void generateAiSummary()} disabled={aiSummaryLoading || !visibleData}>
+              {aiSummaryLoading ? "摘要產生中…" : aiSummary ? "重新產生摘要" : "產生 AI 摘要"}
+            </button>
+            <div className="drawer-summary">
+              {aiSummaryError && <div className="flash err">{aiSummaryError}</div>}
+              {!aiSummaryError && aiSummary && <pre>{aiSummary}</pre>}
+              {!aiSummaryError && !aiSummary && <p className="muted">尚未產生摘要。系統會將目前選中尺寸的既有管制圖資料送至既有 AI summary API。</p>}
+            </div>
+          </aside>
+        </div>
+      )}
+
+      {reportOpen && (
+        <div className="modal-mask" onClick={() => setReportOpen(false)}>
+          <div className="modal report-dialog" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-head"><h2>製程品質報表</h2><button className="modal-x" onClick={() => setReportOpen(false)}>×</button></div>
+            <p className="muted">選擇要放入 A4 橫式報表的區塊。</p>
+            {([
+              ["charts", "管制圖"],
+              ["capability", "製程能力指標"],
+              ["abnormal", "異常判定與清單"],
+              ["ai", "AI 品質摘要"],
+            ] as Array<[keyof typeof reportOptions, string]>).map(([key, label]) => (
+              <label className="report-option" key={key}>
+                <input type="checkbox" checked={reportOptions[key]} onChange={() => toggleReportOption(key)} />
+                <span>{label}</span>
+              </label>
+            ))}
+            <div className="btn-row end"><button className="btn ghost" onClick={() => setReportOpen(false)}>取消</button><button className="btn primary" onClick={printReport} disabled={!Object.values(reportOptions).some(Boolean)}>預覽並列印</button></div>
+          </div>
+        </div>
+      )}
+
+      {reportPreview && (
+        <section className="print-report">
+          <header><div><h1>SPC 製程品質報表</h1><p>{selProduct} / {selProcess} / {selMachine} / {selFeature} / {selChartType}</p></div><div><b>{currentPhase}</b><p>產生時間 {new Date().toLocaleString("zh-TW")}</p></div></header>
+          <div className="print-summary"><span>最新量測 <b>{latestPoint ? fmt(latestPoint.value) : "—"}</b></span><span>樣本 <b>{visibleData?.points.length ?? 0}</b></span><span>失控 <b>{stats.control}</b></span><span>超規 <b>{stats.spec}</b></span><span>Cpk <b>{fmt(metrics?.cpk, 2)}</b>{!hasActiveLimit && "（暫估）"}</span></div>
+          {reportOptions.charts && visibleData && <div className="print-block"><h2>管制圖</h2><ControlChart data={visibleData} mode="monitor" height={225} />{visibleData.mr && <MovingRangeChart data={visibleData.mr} mode="monitor" height={190} />}</div>}
+          {reportOptions.capability && <div className="print-block"><h2>製程能力{hasActiveLimit ? "" : "（Phase I 暫估）"}</h2><div className="print-metrics"><span>Cp {fmt(metrics?.cp, 2)}</span><span>Cpk {fmt(metrics?.cpk, 2)}</span><span>Ppk {fmt(metrics?.ppk, 2)}</span><span>平均 {fmt(metrics?.mean)}</span><span>σ {fmt(metrics?.sigma)}</span><span>USL {fmt(metrics?.usl)}</span><span>LSL {fmt(metrics?.lsl)}</span></div></div>}
+          {reportOptions.abnormal && <div className="print-block"><h2>異常判定</h2><p>正常 {stats.normal} / 失控 {stats.control} / 超規 {stats.spec}</p>{abnormalCount === 0 ? <p>目前無異常點。</p> : <ul>{[...abnormalByChart.primary, ...abnormalByChart.secondary].slice(0, 20).map((item, index) => <li key={`${item.x}-${index}`}>{item.x} · {fmt(item.value)} · {item.violatedRules.map(ruleLabel).join("、")}</li>)}</ul>}</div>}
+          {reportOptions.ai && <div className="print-block"><h2>AI 品質摘要</h2><pre>{aiSummary ?? "尚未產生 AI 摘要。"}</pre></div>}
+          <button className="print-close no-print" onClick={() => setReportPreview(false)}>關閉報表預覽</button>
+        </section>
+      )}
 
       {/* ───────────── 設定 Modal ───────────── */}
       {settingsOpen && (

@@ -48,6 +48,12 @@ import type {
 } from "./types";
 import { DEFAULT_EVENT_TYPE } from "./types";
 import { getSql } from "./neon";
+import type {
+  BaselineDisposition,
+  ExclusionReasonCode,
+  TrialReviewKey,
+  TrialReviewRecord,
+} from "./trialReview";
 
 /**
  * 列出「有測量值」的所有 (品號, 製程, 機台, 球標尺寸名) 組合,
@@ -86,12 +92,32 @@ export async function listFeatureCombos(): Promise<FeatureCombo[]> {
             AND c."管制開始時間" <= CURRENT_TIMESTAMP
             AND (c."管制結束時間" IS NULL OR c."管制結束時間" > CURRENT_TIMESTAMP)
       )              AS has_active_control_limit,
+      COALESCE(
+        (SELECT array_agg(DISTINCT TRIM(c."管制圖類型"))
+           FROM "管制圖" c
+          WHERE c."品號"       = m."品號"
+            AND c."製程"       = m."製程"
+            AND c."機台"       = m."機台"
+            AND c."球標尺寸名" = m."球標尺寸名"
+            AND c."管制是否啟用" = TRUE
+            AND c."管制開始時間" <= CURRENT_TIMESTAMP
+            AND (c."管制結束時間" IS NULL OR c."管制結束時間" > CURRENT_TIMESTAMP)),
+        ARRAY[]::text[]
+      )              AS active_chart_types,
       (SELECT COUNT(*)::int FROM "測量值" m2
         WHERE m2."品號"       = m."品號"
           AND m2."製程"       = m."製程"
           AND m2."機台"       = m."機台"
           AND m2."球標尺寸名" = m."球標尺寸名"
-      )              AS sample_size
+      )              AS sample_size,
+      (SELECT m3."實際值"::float8 FROM "測量值" m3
+        WHERE m3."品號"       = m."品號"
+          AND m3."製程"       = m."製程"
+          AND m3."機台"       = m."機台"
+          AND m3."球標尺寸名" = m."球標尺寸名"
+        ORDER BY m3."流水號" DESC
+        LIMIT 1
+      )              AS latest_value
     FROM "測量值" m
     ORDER BY product, process, machine, feature_name
   `) as unknown as Array<{
@@ -101,7 +127,9 @@ export async function listFeatureCombos(): Promise<FeatureCombo[]> {
     feature_name: string;
     chart_type: string;
     has_active_control_limit: boolean;
+    active_chart_types: string[];
     sample_size: number;
+    latest_value: number | null;
   }>;
 
   return rows.map((r) => ({
@@ -111,7 +139,12 @@ export async function listFeatureCombos(): Promise<FeatureCombo[]> {
     feature_name: r.feature_name,
     chart_type: (r.chart_type as ChartType) ?? "I-MR",
     has_active_control_limit: Boolean(r.has_active_control_limit),
+    active_chart_types: (r.active_chart_types ?? []).filter(
+      (value): value is ChartType =>
+        value === "I-MR" || value === "Xbar-R" || value === "Xbar-S",
+    ),
     sample_size: Number(r.sample_size) || 0,
+    latest_value: r.latest_value == null ? null : Number(r.latest_value),
   }));
 }
 
@@ -155,18 +188,77 @@ export async function getFeature(
     lower_tolerance: Number(sp.lower_tolerance ?? 0),
   };
 
-  // 2) active 管制圖(對應 機台 + 管制圖類型 + 事件區間)
+  // 2) active 管制圖
   //
-  //    「管制圖」沒有事件紀錄id 欄位,只能靠 管制開始時間 對應到區間。
-  //    每個區間核准後會產生一筆,管制開始時間 = 該區間第 N 筆樣本的量測時間,
-  //    必然落在該區間的量測時間範圍內。所以選了區間就用該範圍去框,
-  //    否則會抓到最新一個區間的界線,造成「點是舊區間、線是新區間」的錯配。
+  //    刻意拆成兩個查詢,因為「有沒有 active 版本」和「要畫哪一組界線」是兩個
+  //    不同的問題,混在一起會顧此失彼:
+  //
+  //    2a) 完整 key(品號 + 製程 + 機台 + 尺寸 + 圖型),不帶區間。
+  //        事件區間只決定顯示哪些量測點,不屬於 active key。若此完整 key 已有
+  //        active 版本,切到沒有該尺寸資料的新區間也不能退回 Phase I 或再次試算。
+  //
+  //    2b) 再從中挑出「屬於所選區間」的那一版界線。管制圖 沒有事件紀錄id 欄位,
+  //        只能靠 管制開始時間 落在該區間的量測時間範圍內來對應(管制開始時間
+  //        定義為該區間第 N 筆乾淨樣本的量測時間,必然落在區間內)。
+  //        少了這一步,選舊區間會畫出最新版本的界線 —— 點是舊區間的、線是新
+  //        區間的,畫面看起來正常但完全對不上,而且不會有任何錯誤訊息。
+  //
+  //    所以「該區間還沒核准過界線」的狀態是:has_active = true(不跳試算按鈕)
+  //    但 control_limit = null(圖照畫,只是沒有管制線)。
   //
   //    ⚠️ 管制圖 也沒有事件類型欄位 —— 目前只有「換刀」會建管制線。
   //    若日後要對其他事件類型也建線,兩種類型的區間可能涵蓋同一批量測值,
   //    算出的 管制開始時間 會相同而互相覆蓋同一筆版本;
   //    屆時 管制圖 必須加上事件類型欄位並納入 PK。
   const clRows = (await sql`
+    SELECT
+      c."管制圖類型"           AS chart_type,
+      c."管制中線一"::float8   AS cl,
+      c."管制上界一"::float8   AS ucl,
+      c."管制下界一"::float8   AS lcl,
+      c."管制中線二"::float8   AS secondary_cl,
+      c."管制上界二"::float8   AS secondary_ucl,
+      c."管制下界二"::float8   AS secondary_lcl,
+      c."管制是否啟用"         AS is_active
+    FROM "管制圖" c
+    WHERE NORMALIZE(TRIM(c."品號"))       = NORMALIZE(TRIM(${product}))
+      AND NORMALIZE(TRIM(c."製程"))       = NORMALIZE(TRIM(${process}))
+      AND NORMALIZE(TRIM(c."機台"))       = NORMALIZE(TRIM(${machine}))
+      AND NORMALIZE(TRIM(c."球標尺寸名")) = NORMALIZE(TRIM(${featureName}))
+      AND NORMALIZE(TRIM(c."管制圖類型")) = NORMALIZE(TRIM(${chartType}))
+      AND c."管制是否啟用" = TRUE
+      AND c."管制開始時間" <= CURRENT_TIMESTAMP
+      AND (c."管制結束時間" IS NULL OR c."管制結束時間" > CURRENT_TIMESTAMP)
+    ORDER BY c."管制開始時間" DESC
+    LIMIT 1
+  `) as unknown as Array<{
+    chart_type: string;
+    cl: number | null;
+    ucl: number | null;
+    lcl: number | null;
+    secondary_cl: number | null;
+    secondary_ucl: number | null;
+    secondary_lcl: number | null;
+    is_active: boolean | string;
+  }>;
+
+  const pickActive = (rows: typeof clRows) =>
+    rows.find(
+      (r) =>
+        r.is_active === true ||
+        (r.is_active as unknown as string) === "t" ||
+        (r.is_active as unknown as string) === "true",
+    );
+
+  // 2a) 完整 key 有沒有 active 版本 —— 只用來決定要不要顯示 Phase I 試算按鈕。
+  const activeRow = pickActive(clRows);
+
+  // 2b) 所選區間自己的那一版界線。
+  //     不分區間模式(eventIntervalId 為 null)就沿用 2a 的結果,不必多查一次。
+  const intervalRows: typeof clRows =
+    eventIntervalId == null
+      ? []
+      : ((await sql`
     WITH span AS (
       SELECT MIN(w."量測時間") AS t0, MAX(w."量測時間") AS t1
       FROM "測量值" m
@@ -198,48 +290,33 @@ export async function getFeature(
       AND c."管制是否啟用" = TRUE
       AND c."管制開始時間" <= CURRENT_TIMESTAMP
       AND (c."管制結束時間" IS NULL OR c."管制結束時間" > CURRENT_TIMESTAMP)
-      AND (
-        ${eventIntervalId}::int IS NULL
-        OR c."管制開始時間" BETWEEN
-             (SELECT t0 FROM span) AND (SELECT t1 FROM span)
-      )
+      AND c."管制開始時間" BETWEEN
+            (SELECT t0 FROM span) AND (SELECT t1 FROM span)
     ORDER BY c."管制開始時間" DESC
     LIMIT 1
-  `) as unknown as Array<{
-    chart_type: string;
-    cl: number | null;
-    ucl: number | null;
-    lcl: number | null;
-    secondary_cl: number | null;
-    secondary_ucl: number | null;
-    secondary_lcl: number | null;
-    is_active: boolean | string;
-  }>;
+  `) as unknown as typeof clRows);
 
-  const activeRow = clRows.find(
-    (r) =>
-      r.is_active === true ||
-      (r.is_active as unknown as string) === "t" ||
-      (r.is_active as unknown as string) === "true",
-  );
+  const limitRow =
+    eventIntervalId == null ? activeRow : pickActive(intervalRows);
+
   const control_limit: ControlLimit | null =
-    activeRow && activeRow.cl != null && activeRow.ucl != null && activeRow.lcl != null
+    limitRow && limitRow.cl != null && limitRow.ucl != null && limitRow.lcl != null
       ? {
           // SQL 比對已做 TRIM/NORMALIZE；回傳也要收斂成 request 的 canonical 值，
           // 否則 DB 若含尾端空白，spcClient 會誤判 chart type 不同而丟掉界線。
           chart_type: chartType,
-          cl: Number(activeRow.cl),
-          ucl: Number(activeRow.ucl),
-          lcl: Number(activeRow.lcl),
-          primary_cl: Number(activeRow.cl),
-          primary_ucl: Number(activeRow.ucl),
-          primary_lcl: Number(activeRow.lcl),
+          cl: Number(limitRow.cl),
+          ucl: Number(limitRow.ucl),
+          lcl: Number(limitRow.lcl),
+          primary_cl: Number(limitRow.cl),
+          primary_ucl: Number(limitRow.ucl),
+          primary_lcl: Number(limitRow.lcl),
           secondary_cl:
-            activeRow.secondary_cl == null ? null : Number(activeRow.secondary_cl),
+            limitRow.secondary_cl == null ? null : Number(limitRow.secondary_cl),
           secondary_ucl:
-            activeRow.secondary_ucl == null ? null : Number(activeRow.secondary_ucl),
+            limitRow.secondary_ucl == null ? null : Number(limitRow.secondary_ucl),
           secondary_lcl:
-            activeRow.secondary_lcl == null ? null : Number(activeRow.secondary_lcl),
+            limitRow.secondary_lcl == null ? null : Number(limitRow.secondary_lcl),
           is_active: true,
         }
       : null;
@@ -640,6 +717,13 @@ export async function listEventIntervals(
   }));
 }
 
+/** 舊 API 的相容層；換刀現在是通用事件模型中的預設事件類型。 */
+export async function listToolIntervals(
+  machine: string,
+): Promise<EventInterval[]> {
+  return listEventIntervals(machine, DEFAULT_EVENT_TYPE);
+}
+
 export interface IntervalSampleStat {
   interval_id: number;
   /** 該區間內的乾淨樣本數(是否異常 ≠ TRUE),取該組合所有尺寸的最小值 */
@@ -764,4 +848,83 @@ export async function updateCapabilityValues(
   `) as unknown as Array<{ ok: number }>;
 
   return rows.length;
+}
+
+/** 儲存既有 Phase I signal 的人工審查結果。 */
+export async function saveTrialReview(input: {
+  key: TrialReviewKey;
+  point_id: string;
+  baseline_disposition: BaselineDisposition;
+  exclusion_reason_code: ExclusionReasonCode | null;
+  exclusion_note: string | null;
+  reviewed_by: string | null;
+}): Promise<TrialReviewRecord | null> {
+  const sql = getSql();
+  const reason =
+    input.baseline_disposition === "exclude"
+      ? input.exclusion_reason_code
+      : null;
+  const note =
+    input.baseline_disposition === "exclude"
+      ? input.exclusion_note?.trim() || null
+      : null;
+  const intervalKey = input.key.tool_interval_id ?? -1;
+
+  const rows = (await sql`
+    UPDATE phase_i_trial_review
+       SET review_status = 'reviewed',
+           baseline_disposition = ${input.baseline_disposition},
+           exclusion_reason_code = ${reason},
+           exclusion_note = ${note},
+           reviewed_by = ${input.reviewed_by?.trim() || null},
+           reviewed_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE product = ${input.key.product}
+       AND process = ${input.key.process}
+       AND machine = ${input.key.machine}
+       AND feature_name = ${input.key.feature_name}
+       AND chart_type = ${input.key.chart_type}
+       AND tool_interval_key = ${intervalKey}
+       AND point_id = ${input.point_id}
+     RETURNING
+       point_id,
+       actual_value::float8 AS actual_value,
+       trial_violation,
+       violated_rules,
+       signal_sources,
+       review_status,
+       baseline_disposition,
+       exclusion_reason_code,
+       exclusion_note,
+       reviewed_by,
+       reviewed_at::text AS reviewed_at
+  `) as unknown as Array<{
+    point_id: string;
+    actual_value: number;
+    trial_violation: boolean;
+    violated_rules: string[];
+    signal_sources: TrialReviewRecord["sources"];
+    review_status: TrialReviewRecord["review_status"];
+    baseline_disposition: BaselineDisposition | null;
+    exclusion_reason_code: ExclusionReasonCode | null;
+    exclusion_note: string | null;
+    reviewed_by: string | null;
+    reviewed_at: string | null;
+  }>;
+
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    point_id: row.point_id,
+    actual_value: Number(row.actual_value),
+    trial_violation: row.trial_violation,
+    violated_rules: row.violated_rules ?? [],
+    sources: row.signal_sources ?? [],
+    review_status: row.review_status,
+    baseline_disposition: row.baseline_disposition,
+    exclusion_reason_code: row.exclusion_reason_code,
+    exclusion_note: row.exclusion_note,
+    reviewed_by: row.reviewed_by,
+    reviewed_at: row.reviewed_at,
+  };
 }

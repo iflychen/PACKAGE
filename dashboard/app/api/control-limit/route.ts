@@ -38,12 +38,18 @@ export async function GET(req: NextRequest) {
         c."管制中線二"::float8   AS mr_cl,
         c."管制上界二"::float8   AS mr_ucl,
         c."管制下界二"::float8   AS mr_lcl,
-        c."管制是否啟用"         AS is_active
+        c."管制是否啟用"         AS is_active,
+        c."管制開始時間"         AS started_at,
+        c."管制結束時間"         AS ended_at,
+        c."cp"::float8           AS cp,
+        c."cpk"::float8          AS cpk,
+        c."ppk"::float8          AS ppk
       FROM "管制圖" c
       WHERE NORMALIZE(TRIM(c."品號"))       = NORMALIZE(TRIM(${product}))
         AND NORMALIZE(TRIM(c."製程"))       = NORMALIZE(TRIM(${process}))
         AND NORMALIZE(TRIM(c."機台"))       = NORMALIZE(TRIM(${machine}))
         AND NORMALIZE(TRIM(c."球標尺寸名")) = NORMALIZE(TRIM(${feature}))
+      ORDER BY c."管制開始時間" DESC, c."管制圖類型"
     `;
     return NextResponse.json({
       product,

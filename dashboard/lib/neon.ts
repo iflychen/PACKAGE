@@ -9,6 +9,9 @@
 //     lib/db.ts、app/api/db-info、app/api/neon-diagnose 等處都引用這些名稱，
 //     改名等於要動好幾個檔案。這裡只換底層實作，對外介面完全不變。
 //
+//  ⚠️ 合併上游時請保留這個檔案的本版本。上游 (englishorspanish-2/RRealproject)
+//     仍是 @neondatabase/serverless，拿上游那份去建 image 會連不上容器 postgres。
+//
 //  用法不變：
 //    const rows = await sql`SELECT * FROM "球標尺寸" WHERE "品號" = ${p}`;
 //  參數一樣會被轉成 $1, $2 帶入，不會有 SQL injection。

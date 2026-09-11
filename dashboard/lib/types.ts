@@ -160,7 +160,11 @@ export interface FeatureCombo {
   feature_name: string;
   chart_type: ChartType;
   has_active_control_limit: boolean;
+  /** 目前啟用中的管制圖類型；sidebar 必須用它和當前圖型做完整 key 判斷。 */
+  active_chart_types?: ChartType[];
   sample_size: number;
+  /** 該尺寸目前資料集中最後一筆量測值（尺寸清單唯讀顯示用）。 */
+  latest_value?: number | null;
 }
 
 export interface ProcessesResponse {

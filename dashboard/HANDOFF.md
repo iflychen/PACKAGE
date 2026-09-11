@@ -68,6 +68,11 @@ Important behavior:
 - Phase II measurement processing only analyzes against the active DB limits.
 - Approval is the only normal UI path that writes a new active control-limit version.
 - The server recalculates again during approval so client-supplied limit values are never trusted.
+- `POST /api/measurements/ingest` must use the actual database conflict keys:
+  `工件 (機台, 流水號)` and `測量值 (機台, 流水號, 球標尺寸名)`.
+  The workpiece and measurement upserts are one atomic SQL statement. Reusing a
+  machine/serial (or machine/serial/feature) for a different product/process is
+  rejected with HTTP 409 instead of silently attaching data to the wrong record.
 
 ## Abnormal List and Multi-point Rules
 
@@ -303,6 +308,24 @@ c."管制開始時間" BETWEEN (interval min 量測時間) AND (interval max 量
 
 Without this the query returns the newest version regardless of the selected
 interval, silently plotting old-tool points against new-tool limits.
+
+**Two separate questions, two separate queries.** "Does an active version exist?"
+and "which version's limits do we draw?" must not share one query — answering
+both from a single lookup breaks one of them:
+
+| Query | Scope | Drives |
+| --- | --- | --- |
+| 2a | full key, **no** interval | `has_active_control_limit` |
+| 2b | full key **plus** the `管制開始時間 BETWEEN` window above | `control_limit` |
+
+If 2a were interval-scoped, selecting an interval that has no data for that
+feature would report no active version and the dashboard would offer a Phase I
+trial for a feature that is already approved. If 2b were not interval-scoped,
+old intervals would be drawn against the newest version's limits.
+
+So "this interval has no approved limits yet" is represented as
+`has_active_control_limit = true` with `control_limit = null`: the chart renders
+its points, draws no control lines, and does not offer the trial button.
 
 **Every interval keeps its own active row.** `approveFeatureTrial()` only
 deactivates older versions when `tool_interval_id` is null (machines with no

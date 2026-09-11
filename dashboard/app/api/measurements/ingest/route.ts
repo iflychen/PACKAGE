@@ -56,7 +56,7 @@ export async function POST(req: NextRequest) {
   const featureName = body.feature_name?.trim();
   const actualValue = body.actual_value;
   const measuredAt = body.measured_at;
-  const measuredBy = body.measured_by;
+  const measuredBy = body.measured_by?.trim() || null;
   const chartTypeRaw = body.chart_type?.trim() ?? "I-MR";
   const chartType: ChartType = VALID_CHART_TYPES.includes(
     chartTypeRaw as ChartType,
@@ -71,40 +71,94 @@ export async function POST(req: NextRequest) {
     typeof serialNo !== "number" ||
     !Number.isInteger(serialNo) ||
     !featureName ||
-    typeof actualValue !== "number"
+    typeof actualValue !== "number" ||
+    !Number.isFinite(actualValue) ||
+    (measuredAt != null && !Number.isFinite(Date.parse(measuredAt)))
   ) {
     return NextResponse.json(
       {
         error:
-          "缺少必要欄位。需要 product, process, machine, serial_no, feature_name, actual_value(number)。",
+          "缺少必要欄位或格式錯誤。需要 product, process, machine, serial_no, feature_name, actual_value(有限數字)，measured_at 必須是有效日期。",
         threshold_hint: `Phase I 門檻:${getMinSamples()} 筆`,
       },
       { status: 400 },
     );
   }
 
-  // 1) 寫入 工件 + 測量值
+  // 1) 寫入 工件 + 測量值。
+  //
+  // DB 真正的 PK 是：
+  //   工件   (機台, 流水號)
+  //   測量值 (機台, 流水號, 球標尺寸名)
+  // 品號／製程不在 PK 內，不能放進 ON CONFLICT target。兩筆寫入收在同一個
+  // data-modifying CTE，尺寸 FK 等任一錯誤都會讓整句 rollback，不留下孤立工件。
   try {
     const sql = getSql();
-    await sql`
-      INSERT INTO "工件" ("品號", "製程", "機台", "流水號", "量測時間", "量測人員")
-      VALUES (
-        ${product}, ${process}, ${machine}, ${serialNo},
-        ${measuredAt ? measuredAt : new Date().toISOString()},
-        ${measuredBy ?? null}
+    const measuredAtValue = measuredAt ?? new Date().toISOString();
+    const rows = (await sql`
+      WITH inserted_workpiece AS (
+        INSERT INTO "工件"
+          ("品號", "製程", "機台", "流水號", "量測時間", "量測人員")
+        VALUES
+          (${product}, ${process}, ${machine}, ${serialNo},
+           ${measuredAtValue}, ${measuredBy})
+        ON CONFLICT ("機台", "流水號") DO NOTHING
+        RETURNING 1
+      ),
+      valid_workpiece AS (
+        SELECT 1 FROM inserted_workpiece
+        UNION ALL
+        SELECT 1
+          FROM "工件" w
+         WHERE w."機台" = ${machine}
+           AND w."流水號" = ${serialNo}
+           AND NORMALIZE(TRIM(w."品號")) = NORMALIZE(TRIM(${product}))
+           AND NORMALIZE(TRIM(w."製程")) = NORMALIZE(TRIM(${process}))
+        LIMIT 1
+      ),
+      upserted_measurement AS (
+        INSERT INTO "測量值"
+          ("品號", "製程", "機台", "流水號", "球標尺寸名",
+           "實際值", "是否異常", "異常類型")
+        SELECT
+          ${product}, ${process}, ${machine}, ${serialNo}, ${featureName},
+          ${actualValue}, FALSE, NULL
+        WHERE EXISTS (SELECT 1 FROM valid_workpiece)
+        ON CONFLICT ("機台", "流水號", "球標尺寸名")
+        DO UPDATE SET
+          "實際值" = EXCLUDED."實際值",
+          "是否異常" = FALSE,
+          "異常類型" = NULL
+        WHERE NORMALIZE(TRIM("測量值"."品號")) = NORMALIZE(TRIM(EXCLUDED."品號"))
+          AND NORMALIZE(TRIM("測量值"."製程")) = NORMALIZE(TRIM(EXCLUDED."製程"))
+        RETURNING 1
       )
-      ON CONFLICT ("品號", "製程", "機台", "流水號") DO NOTHING
-    `;
-    await sql`
-      INSERT INTO "測量值"
-        ("品號", "製程", "機台", "流水號", "球標尺寸名",
-         "實際值", "是否異常", "異常類型")
-      VALUES
-        (${product}, ${process}, ${machine}, ${serialNo}, ${featureName},
-         ${actualValue}, FALSE, NULL)
-      ON CONFLICT ("品號", "製程", "機台", "流水號", "球標尺寸名")
-      DO UPDATE SET "實際值" = EXCLUDED."實際值"
-    `;
+      SELECT
+        EXISTS (SELECT 1 FROM valid_workpiece) AS workpiece_ok,
+        EXISTS (SELECT 1 FROM upserted_measurement) AS measurement_ok
+    `) as unknown as Array<{
+      workpiece_ok: boolean;
+      measurement_ok: boolean;
+    }>;
+
+    if (!rows[0]?.workpiece_ok) {
+      return NextResponse.json(
+        {
+          error: "流水號衝突",
+          detail: `機台 ${machine} 的流水號 ${serialNo} 已屬於其他品號或製程。`,
+        },
+        { status: 409 },
+      );
+    }
+    if (!rows[0]?.measurement_ok) {
+      return NextResponse.json(
+        {
+          error: "量測值識別衝突",
+          detail: `機台 ${machine}、流水號 ${serialNo}、尺寸 ${featureName} 已屬於其他品號或製程。`,
+        },
+        { status: 409 },
+      );
+    }
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
