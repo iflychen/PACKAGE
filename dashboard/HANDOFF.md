@@ -268,6 +268,11 @@ data — it is the same 工件 seen from each event timeline. Consequences:
   `event_type` parameter. `/api/chart`, `/api/capability`,
   `/api/control-limit/trial` and `/api/control-limit/approve` all take
   `event_type` too.
+- The old `/api/tool-intervals` route and its `listToolIntervals()` wrapper were
+  removed. They hardcoded 事件類型 to `換刀`, so once a second event type exists
+  they would silently return only the 換刀 intervals — HTTP 200, correct-looking
+  shape, wrong data. Anything still calling the old path must pass
+  `event_type=換刀` to `/api/event-intervals` instead.
 - Changing 事件類型 in the UI resets `selInterval` to null. Interval ids are
   scoped to one event type; reusing an id across types selects zero rows.
 - Like the other selects, changing 事件類型 cancels a pending auto batch and
@@ -342,7 +347,7 @@ time and not at approval time.
 - `getIntervalSampleStats()` in `lib/db.ts` computes it with
   `ROW_NUMBER()` partitioned by interval plus
   `MIN(measured_at) FILTER (WHERE rn = min_samples)`.
-- `GET /api/tool-intervals` returns it per interval so the dropdown can show
+- `GET /api/event-intervals` returns it per interval so the dropdown can show
   `✓` for ready intervals and `(n/N)` for ones still accumulating.
 - `approveFeatureTrial()` writes it into `管制圖.管制開始時間`. It only falls
   back to `now()` when the baseline samples have no 量測時間.

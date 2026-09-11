@@ -717,13 +717,6 @@ export async function listEventIntervals(
   }));
 }
 
-/** 舊 API 的相容層；換刀現在是通用事件模型中的預設事件類型。 */
-export async function listToolIntervals(
-  machine: string,
-): Promise<EventInterval[]> {
-  return listEventIntervals(machine, DEFAULT_EVENT_TYPE);
-}
-
 export interface IntervalSampleStat {
   interval_id: number;
   /** 該區間內的乾淨樣本數(是否異常 ≠ TRUE),取該組合所有尺寸的最小值 */
