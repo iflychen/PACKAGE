@@ -53,6 +53,7 @@ import type {
   ExclusionReasonCode,
   TrialReviewKey,
   TrialReviewRecord,
+  TrialSignal,
 } from "./trialReview";
 
 /**
@@ -577,26 +578,36 @@ export async function getDailySummary(
   const unit = bucket === "day" ? "day" : "hour";
   const labelFmt = bucket === "day" ? "MM/DD" : "MM/DD HH24:MI";
 
+  // date_trunc 只在子查詢裡出現一次,外層用欄位別名分組。
+  //
+  // 不能在 SELECT 和 GROUP BY 各寫一次 date_trunc(${unit}, ...):PostgreSQL
+  // 判斷「SELECT 的運算式有沒有出現在 GROUP BY」是比對語法樹,而每個 ${} 都是
+  // 獨立的參數編號,$1 和 $8 就算值一樣也算不同運算式,會被判成
+  // 「column must appear in the GROUP BY clause」。
   const rows = (await sql`
     SELECT
-      to_char(date_trunc(${unit}, w."量測時間"), ${labelFmt}) AS label,
-      date_trunc(${unit}, w."量測時間")                        AS bucket_at,
-      AVG(m."實際值")::float8                                  AS avg_value,
-      COUNT(*)::int                                            AS cnt
-    FROM "測量值" m
-    JOIN "工件_含事件" w
-      ON w."機台"   = m."機台"
-     AND w."流水號" = m."流水號"
-     AND NORMALIZE(TRIM(w."事件類型")) = NORMALIZE(TRIM(${eventType}))
-    WHERE NORMALIZE(TRIM(m."品號"))       = NORMALIZE(TRIM(${product}))
-      AND NORMALIZE(TRIM(m."製程"))       = NORMALIZE(TRIM(${process}))
-      AND NORMALIZE(TRIM(m."機台"))       = NORMALIZE(TRIM(${machine}))
-      AND NORMALIZE(TRIM(m."球標尺寸名")) = NORMALIZE(TRIM(${featureName}))
-      AND w."量測時間" IS NOT NULL
-      AND (${eventIntervalId}::int IS NULL
-           OR w."事件紀錄id" = ${eventIntervalId}::int)
-    GROUP BY date_trunc(${unit}, w."量測時間")
-    ORDER BY date_trunc(${unit}, w."量測時間")
+      to_char(bucket_at, ${labelFmt})  AS label,
+      AVG(actual_value)::float8        AS avg_value,
+      COUNT(*)::int                    AS cnt
+    FROM (
+      SELECT
+        date_trunc(${unit}, w."量測時間") AS bucket_at,
+        m."實際值"                        AS actual_value
+      FROM "測量值" m
+      JOIN "工件_含事件" w
+        ON w."機台"   = m."機台"
+       AND w."流水號" = m."流水號"
+       AND NORMALIZE(TRIM(w."事件類型")) = NORMALIZE(TRIM(${eventType}))
+      WHERE NORMALIZE(TRIM(m."品號"))       = NORMALIZE(TRIM(${product}))
+        AND NORMALIZE(TRIM(m."製程"))       = NORMALIZE(TRIM(${process}))
+        AND NORMALIZE(TRIM(m."機台"))       = NORMALIZE(TRIM(${machine}))
+        AND NORMALIZE(TRIM(m."球標尺寸名")) = NORMALIZE(TRIM(${featureName}))
+        AND w."量測時間" IS NOT NULL
+        AND (${eventIntervalId}::int IS NULL
+             OR w."事件紀錄id" = ${eventIntervalId}::int)
+    ) buckets
+    GROUP BY bucket_at
+    ORDER BY bucket_at
   `) as unknown as Array<{
     label: string;
     avg_value: number;
@@ -843,6 +854,146 @@ export async function updateCapabilityValues(
   return rows.length;
 }
 
+// ============================================================================
+//  Phase I 試算疑似異常點的覆核紀錄 (phase_i_trial_review)
+//  ---------------------------------------------------------------------------
+//  流程:
+//    1. 試算  → syncTrialReviews() 以 pending 寫入 / 更新本次的疑似異常點
+//    2. 覆核  → saveTrialReview() 把單一點改成 reviewed + 處置 + 原因
+//
+//  主鍵不含事件類型,因為區間 id 本身已經隱含了事件類型(同一個 id 只屬於
+//  一種事件類型)。不分區間時以 -1 當哨兵值,因為主鍵欄位不可為 NULL。
+// ============================================================================
+
+interface TrialReviewRow {
+  point_id: string;
+  actual_value: number;
+  trial_violation: boolean;
+  violated_rules: string[];
+  signal_sources: TrialReviewRecord["sources"];
+  review_status: TrialReviewRecord["review_status"];
+  baseline_disposition: BaselineDisposition | null;
+  exclusion_reason_code: ExclusionReasonCode | null;
+  exclusion_note: string | null;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+}
+
+function toTrialReviewRecord(row: TrialReviewRow): TrialReviewRecord {
+  return {
+    point_id: row.point_id,
+    actual_value: Number(row.actual_value),
+    trial_violation: row.trial_violation,
+    violated_rules: row.violated_rules ?? [],
+    sources: row.signal_sources ?? [],
+    review_status: row.review_status,
+    baseline_disposition: row.baseline_disposition,
+    exclusion_reason_code: row.exclusion_reason_code,
+    exclusion_note: row.exclusion_note,
+    reviewed_by: row.reviewed_by,
+    reviewed_at: row.reviewed_at,
+  };
+}
+
+/** 列出某組合目前所有覆核紀錄。仍被判異常的排前面。 */
+export async function listTrialReviews(
+  key: TrialReviewKey,
+): Promise<TrialReviewRecord[]> {
+  const sql = getSql();
+  const intervalKey = key.event_interval_id ?? -1;
+
+  const rows = (await sql`
+    SELECT
+      point_id,
+      actual_value::float8 AS actual_value,
+      trial_violation,
+      violated_rules,
+      signal_sources,
+      review_status,
+      baseline_disposition,
+      exclusion_reason_code,
+      exclusion_note,
+      reviewed_by,
+      reviewed_at::text AS reviewed_at
+    FROM phase_i_trial_review
+    WHERE product = ${key.product}
+      AND process = ${key.process}
+      AND machine = ${key.machine}
+      AND feature_name = ${key.feature_name}
+      AND chart_type = ${key.chart_type}
+      AND event_interval_key = ${intervalKey}
+    -- point_id 是 varchar,直接排序 "10" 會跑到 "9" 前面。
+    -- 先比長度再比字典序,對純數字的流水號就等同數值排序。
+    ORDER BY trial_violation DESC, length(point_id), point_id
+  `) as unknown as TrialReviewRow[];
+
+  return rows.map(toTrialReviewRecord);
+}
+
+/**
+ * 把本次試算的疑似異常點同步進覆核表,回傳同步後的完整清單。
+ *
+ * 呼叫端要先依 point_id 合併 —— 同一個點可能同時在上圖與下圖觸發,
+ * 但主鍵是 point_id,兩張圖的來源要收進 sources 陣列而不是寫成兩列。
+ *
+ * ⚠️ upsert 只更新「這次算出來的事實」(actual_value / violated_rules /
+ *    signal_sources / trial_violation),絕對不碰 review_status、
+ *    baseline_disposition、exclusion_*、reviewed_* —— 那些是人工覆核結果,
+ *    每次重算都被洗掉的話稽核軌跡就失去意義了。
+ *
+ * 這次不再異常的舊點保留該列,只把 trial_violation 標成 false,理由同上:
+ * 「某人曾經排除過這個點、理由是什麼」本身就是要留存的紀錄。
+ */
+export async function syncTrialReviews(
+  key: TrialReviewKey,
+  signals: TrialSignal[],
+): Promise<TrialReviewRecord[]> {
+  const sql = getSql();
+  const intervalKey = key.event_interval_id ?? -1;
+
+  for (const signal of signals) {
+    await sql`
+      INSERT INTO phase_i_trial_review
+        (product, process, machine, feature_name, chart_type,
+         event_interval_key, point_id, actual_value,
+         trial_violation, violated_rules, signal_sources, updated_at)
+      VALUES
+        (${key.product}, ${key.process}, ${key.machine},
+         ${key.feature_name}, ${key.chart_type},
+         ${intervalKey}, ${signal.point_id}, ${signal.actual_value},
+         TRUE,
+         ${JSON.stringify(signal.violated_rules ?? [])}::jsonb,
+         ${JSON.stringify(signal.sources ?? [])}::jsonb,
+         CURRENT_TIMESTAMP)
+      ON CONFLICT (product, process, machine, feature_name, chart_type,
+                   event_interval_key, point_id)
+      DO UPDATE SET
+        actual_value    = EXCLUDED.actual_value,
+        trial_violation = TRUE,
+        violated_rules  = EXCLUDED.violated_rules,
+        signal_sources  = EXCLUDED.signal_sources,
+        updated_at      = CURRENT_TIMESTAMP
+    `;
+  }
+
+  const stillFlagged = signals.map((signal) => signal.point_id);
+  await sql`
+    UPDATE phase_i_trial_review
+       SET trial_violation = FALSE,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE product = ${key.product}
+       AND process = ${key.process}
+       AND machine = ${key.machine}
+       AND feature_name = ${key.feature_name}
+       AND chart_type = ${key.chart_type}
+       AND event_interval_key = ${intervalKey}
+       AND trial_violation = TRUE
+       AND NOT (point_id = ANY(${stillFlagged}::text[]))
+  `;
+
+  return listTrialReviews(key);
+}
+
 /** 儲存既有 Phase I signal 的人工審查結果。 */
 export async function saveTrialReview(input: {
   key: TrialReviewKey;
@@ -861,7 +1012,7 @@ export async function saveTrialReview(input: {
     input.baseline_disposition === "exclude"
       ? input.exclusion_note?.trim() || null
       : null;
-  const intervalKey = input.key.tool_interval_id ?? -1;
+  const intervalKey = input.key.event_interval_id ?? -1;
 
   const rows = (await sql`
     UPDATE phase_i_trial_review
@@ -877,7 +1028,7 @@ export async function saveTrialReview(input: {
        AND machine = ${input.key.machine}
        AND feature_name = ${input.key.feature_name}
        AND chart_type = ${input.key.chart_type}
-       AND tool_interval_key = ${intervalKey}
+       AND event_interval_key = ${intervalKey}
        AND point_id = ${input.point_id}
      RETURNING
        point_id,
@@ -891,33 +1042,9 @@ export async function saveTrialReview(input: {
        exclusion_note,
        reviewed_by,
        reviewed_at::text AS reviewed_at
-  `) as unknown as Array<{
-    point_id: string;
-    actual_value: number;
-    trial_violation: boolean;
-    violated_rules: string[];
-    signal_sources: TrialReviewRecord["sources"];
-    review_status: TrialReviewRecord["review_status"];
-    baseline_disposition: BaselineDisposition | null;
-    exclusion_reason_code: ExclusionReasonCode | null;
-    exclusion_note: string | null;
-    reviewed_by: string | null;
-    reviewed_at: string | null;
-  }>;
+  `) as unknown as TrialReviewRow[];
 
   const row = rows[0];
   if (!row) return null;
-  return {
-    point_id: row.point_id,
-    actual_value: Number(row.actual_value),
-    trial_violation: row.trial_violation,
-    violated_rules: row.violated_rules ?? [],
-    sources: row.signal_sources ?? [],
-    review_status: row.review_status,
-    baseline_disposition: row.baseline_disposition,
-    exclusion_reason_code: row.exclusion_reason_code,
-    exclusion_note: row.exclusion_note,
-    reviewed_by: row.reviewed_by,
-    reviewed_at: row.reviewed_at,
-  };
+  return toTrialReviewRecord(row);
 }

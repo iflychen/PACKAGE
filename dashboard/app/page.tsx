@@ -20,6 +20,11 @@ import {
 } from "@/lib/labels";
 import type { ChartApiResponse, ChartType, FeatureCombo } from "@/lib/types";
 import { DEFAULT_EVENT_TYPE } from "@/lib/types";
+import { EXCLUSION_REASON_OPTIONS } from "@/lib/trialReview";
+import type {
+  ExclusionReasonCode,
+  TrialReviewRecord,
+} from "@/lib/trialReview";
 
 const CHART_TYPES: ChartType[] = ["I-MR", "Xbar-R", "Xbar-S"];
 type ChartViewMode = "monitor" | "analysis";
@@ -91,9 +96,25 @@ interface PhaseITrialResponse {
     actual_value: number;
     violated_rules: string[];
   }>;
+  /**
+   * 覆核紀錄。每個 point_id 一筆(上下圖觸發同一點時已合併),
+   * 帶著先前存過的處置與原因。覆核表不存在時會是空陣列並附 review_error。
+   */
+  reviews?: TrialReviewRecord[];
+  review_error?: string;
   /** 累積到足夠樣本那一刻的量測時間;核准時會寫進管制圖的「管制開始時間」 */
   control_start_time?: string | null;
   chart: ChartApiResponse;
+}
+
+/** 畫面上一列疑似異常點。已依 point_id 合併上下圖來源。 */
+interface SuspectedRow {
+  pointId: string;
+  actualValue: number;
+  violatedRules: string[];
+  sources: Array<{ chart: "primary" | "secondary"; component_type: string }>;
+  /** 先前存過的覆核結果；覆核表不可用時為 null。 */
+  review: TrialReviewRecord | null;
 }
 
 interface AbnormalListItem {
@@ -353,6 +374,12 @@ export default function Page() {
   const [excludedPointIds, setExcludedPointIds] = useState<Set<string>>(
     () => new Set(),
   );
+  // 覆核草稿:使用者在畫面上選的原因與備註,按下儲存才送到後端。
+  const [reviewDrafts, setReviewDrafts] = useState<
+    Record<string, { reason: ExclusionReasonCode | ""; note: string }>
+  >({});
+  const [reviewSaving, setReviewSaving] = useState(false);
+  const [reviewMessage, setReviewMessage] = useState<string | null>(null);
   const [approving, setApproving] = useState(false);
   const [approvalMessage, setApprovalMessage] = useState<string | null>(null);
   const [chartRevision, setChartRevision] = useState(0);
@@ -1078,6 +1105,161 @@ export default function Page() {
       else next.add(key);
       return next;
     });
+  };
+
+  /**
+   * 疑似異常點清單。
+   *
+   * 優先用後端回來的 reviews —— 每個 point_id 一列(上下圖觸發同一點時已合併),
+   * 而且帶著先前存過的覆核結果。
+   *
+   * 覆核表不可用時(例如某環境還沒跑過 db/migrations)退回 suspected_points,
+   * 自行依 point_id 合併。功能降級成「只能勾選排除、不留紀錄」,但不會壞掉。
+   */
+  const suspectedRows = useMemo<SuspectedRow[]>(() => {
+    if (!trialData) return [];
+
+    if (trialData.reviews?.length) {
+      return trialData.reviews
+        .filter((review) => review.trial_violation)
+        .map((review) => ({
+          pointId: review.point_id,
+          actualValue: review.actual_value,
+          violatedRules: review.violated_rules,
+          sources: review.sources,
+          review,
+        }));
+    }
+
+    const merged = new Map<string, SuspectedRow>();
+    for (const point of trialData.suspected_points) {
+      const id = String(point.point_id);
+      const existing = merged.get(id);
+      if (existing) {
+        existing.violatedRules = Array.from(
+          new Set([...existing.violatedRules, ...point.violated_rules]),
+        );
+        existing.sources.push({
+          chart: point.chart,
+          component_type: point.component_type,
+        });
+      } else {
+        merged.set(id, {
+          pointId: id,
+          actualValue: point.actual_value,
+          violatedRules: [...point.violated_rules],
+          sources: [
+            { chart: point.chart, component_type: point.component_type },
+          ],
+          review: null,
+        });
+      }
+    }
+    return Array.from(merged.values());
+  }, [trialData]);
+
+  const reviewTableUnavailable = Boolean(trialData?.review_error);
+
+  /**
+   * 試算結果一回來,就把先前存過的覆核結果帶回畫面:原因/備註填回草稿,
+   * 上次判定為排除的點自動勾選。這正是「留紀錄」的價值 —— 換人接手、
+   * 隔天再打開,都看得到當初排除了哪些點、理由是什麼。
+   */
+  useEffect(() => {
+    if (!trialData) {
+      setReviewDrafts({});
+      setReviewMessage(null);
+      return;
+    }
+    const drafts: Record<
+      string,
+      { reason: ExclusionReasonCode | ""; note: string }
+    > = {};
+    const previouslyExcluded = new Set<string>();
+    for (const review of trialData.reviews ?? []) {
+      drafts[review.point_id] = {
+        reason: review.exclusion_reason_code ?? "",
+        note: review.exclusion_note ?? "",
+      };
+      if (review.baseline_disposition === "exclude") {
+        previouslyExcluded.add(review.point_id);
+      }
+    }
+    setReviewDrafts(drafts);
+    setReviewMessage(null);
+    if (previouslyExcluded.size > 0) {
+      setExcludedPointIds((current) => {
+        const next = new Set(current);
+        previouslyExcluded.forEach((id) => next.add(id));
+        return next;
+      });
+    }
+  }, [trialData]);
+
+  const setReviewDraft = (
+    pointId: string,
+    patch: Partial<{ reason: ExclusionReasonCode | ""; note: string }>,
+  ) => {
+    setReviewDrafts((current) => ({
+      ...current,
+      [pointId]: {
+        reason: current[pointId]?.reason ?? "",
+        note: current[pointId]?.note ?? "",
+        ...patch,
+      },
+    }));
+  };
+
+  /**
+   * 把畫面上每個疑似異常點的處置寫進覆核表。
+   *
+   * 勾選 = exclude(必須有原因),未勾選 = retain。驗證規則跟後端與資料庫的
+   * CHECK 約束一致,在這裡先擋只是為了給即時回饋 —— 真正把關的是 DB。
+   */
+  const saveTrialReviews = async () => {
+    if (!trialData || suspectedRows.length === 0) return;
+    setReviewSaving(true);
+    setReviewMessage(null);
+    setTrialError(null);
+    try {
+      for (const row of suspectedRows) {
+        const draft = reviewDrafts[row.pointId] ?? { reason: "", note: "" };
+        const excluded = excludedPointIds.has(row.pointId);
+
+        if (excluded && !draft.reason) {
+          setTrialError(`#${row.pointId} 排除時必須選擇原因。`);
+          return;
+        }
+        if (excluded && draft.reason === "other" && !draft.note.trim()) {
+          setTrialError(`#${row.pointId} 原因選「其他」時必須填補充說明。`);
+          return;
+        }
+
+        const response = await fetch("/api/control-limit/review", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...phaseIRequestBody(excludedPointIds),
+            point_id: row.pointId,
+            baseline_disposition: excluded ? "exclude" : "retain",
+            exclusion_reason_code: excluded ? draft.reason : null,
+            exclusion_note: excluded ? draft.note.trim() || null : null,
+          }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          setTrialError(
+            payload.error ?? `#${row.pointId} 覆核紀錄儲存失敗。`,
+          );
+          return;
+        }
+      }
+      setReviewMessage(`已儲存 ${suspectedRows.length} 筆覆核紀錄。`);
+    } catch (err) {
+      setTrialError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setReviewSaving(false);
+    }
   };
 
   const approvePhaseITrial = async () => {
@@ -2028,30 +2210,84 @@ export default function Page() {
                     </span>
                   </div>
                   <div className="trial-list">
-                    {trialData?.suspected_points.length ? (
-                      trialData.suspected_points.map((pt) => {
-                        const key = String(pt.point_id);
+                    {suspectedRows.length ? (
+                      suspectedRows.map((row) => {
+                        const excluded = excludedPointIds.has(row.pointId);
+                        const draft = reviewDrafts[row.pointId] ?? {
+                          reason: "" as ExclusionReasonCode | "",
+                          note: "",
+                        };
+                        const reviewed =
+                          row.review?.review_status === "reviewed";
                         return (
-                          <label
-                            key={`${pt.chart}-${pt.component_type}-${key}`}
-                            className="trial-item"
-                            title={pt.violated_rules.map(ruleLabel).join("、")}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={excludedPointIds.has(key)}
-                              onChange={() => toggleExcludedPoint(pt.point_id)}
-                            />
-                            <span>
-                              <span
-                                className={`trial-src ${pt.chart}`}
-                              >
-                                {pt.chart === "primary" ? "上" : "下"}
-                                {pt.component_type}
+                          <div key={row.pointId} className="trial-item-block">
+                            <label
+                              className="trial-item"
+                              title={row.violatedRules.map(ruleLabel).join("、")}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={excluded}
+                                onChange={() =>
+                                  toggleExcludedPoint(row.pointId)
+                                }
+                              />
+                              <span>
+                                {row.sources.map((src) => (
+                                  <span
+                                    key={`${src.chart}-${src.component_type}`}
+                                    className={`trial-src ${src.chart}`}
+                                  >
+                                    {src.chart === "primary" ? "上" : "下"}
+                                    {src.component_type}
+                                  </span>
+                                ))}
+                                #{row.pointId} · {row.actualValue}
+                                {!reviewTableUnavailable && (
+                                  <span
+                                    className={`review-tag ${
+                                      reviewed ? "done" : "pending"
+                                    }`}
+                                  >
+                                    {reviewed ? "已覆核" : "未覆核"}
+                                  </span>
+                                )}
                               </span>
-                              #{key} · {pt.actual_value}
-                            </span>
-                          </label>
+                            </label>
+                            {excluded && !reviewTableUnavailable && (
+                              <div className="review-fields">
+                                <select
+                                  value={draft.reason}
+                                  onChange={(e) =>
+                                    setReviewDraft(row.pointId, {
+                                      reason: e.target.value as
+                                        | ExclusionReasonCode
+                                        | "",
+                                    })
+                                  }
+                                >
+                                  <option value="">選擇排除原因…</option>
+                                  {EXCLUSION_REASON_OPTIONS.map((opt) => (
+                                    <option key={opt.value} value={opt.value}>
+                                      {opt.label}
+                                    </option>
+                                  ))}
+                                </select>
+                                {draft.reason === "other" && (
+                                  <input
+                                    type="text"
+                                    placeholder="補充說明(必填)"
+                                    value={draft.note}
+                                    onChange={(e) =>
+                                      setReviewDraft(row.pointId, {
+                                        note: e.target.value,
+                                      })
+                                    }
+                                  />
+                                )}
+                              </div>
+                            )}
+                          </div>
                         );
                       })
                     ) : trialData ? (
@@ -2082,9 +2318,32 @@ export default function Page() {
                   )}
                 </div>
 
+                {reviewTableUnavailable && (
+                  <div className="flash warn tiny">
+                    覆核紀錄不可用（資料庫尚未套用 db/migrations）。勾選排除仍然
+                    有效，但不會留下稽核紀錄。
+                  </div>
+                )}
                 {trialError && <div className="flash err tiny">{trialError}</div>}
+                {reviewMessage && (
+                  <div className="flash ok tiny">{reviewMessage}</div>
+                )}
 
                 <div className="btn-row">
+                  <button
+                    className="btn ghost"
+                    onClick={() => void saveTrialReviews()}
+                    disabled={
+                      !trialData ||
+                      suspectedRows.length === 0 ||
+                      reviewSaving ||
+                      trialLoading ||
+                      reviewTableUnavailable
+                    }
+                    title="把每個疑似異常點的處置與原因寫進覆核紀錄"
+                  >
+                    {reviewSaving ? "儲存中…" : "儲存覆核"}
+                  </button>
                   <button
                     className="btn ghost"
                     onClick={() =>

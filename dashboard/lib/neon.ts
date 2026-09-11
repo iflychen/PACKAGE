@@ -99,11 +99,16 @@ export type SqlTag = <T = Record<string, unknown>>(
  *
  * 把 sql`... ${a} ... ${b}` 轉成 ("... $1 ... $2", [a, b])。
  *
- * 相同的值會共用同一個 $n —— 這不只是省參數。PostgreSQL 判斷
- * 「SELECT 的運算式有沒有出現在 GROUP BY」是比對語法樹，$1 和 $3 就算值一樣
- * 也算不同運算式。lib/db.ts 的 getDailySummary 正好在 SELECT 和 GROUP BY
- * 都用了 date_trunc(${unit}, ...)，不去重的話會被 PG 判定為
- * 「column must appear in the GROUP BY clause」。
+ * ⚠️ 每個 ${} 一律配一個新的 $n，即使值完全相同也不共用。
+ *
+ * 曾經試過「相同的值共用同一個 $n」，那是錯的：PostgreSQL 是從「參數被用在
+ * 哪個欄位」去推參數型別，同一個 $n 出現在兩個型別不同的欄位就會直接報
+ * inconsistent types deduced for parameter $n。最典型的例子是兩個都傳 null
+ * 的欄位，一個是 text、一個是 varchar，合併之後就炸了。
+ *
+ * 相對地，「同一個運算式要在 SELECT 和 GROUP BY 都出現」那種需求不該靠去重
+ * 解決，而是把運算式收進子查詢、外層用欄位別名分組
+ * (見 lib/db.ts 的 getDailySummary)。
  */
 export function getSql(): SqlTag {
   const pool = getPool();
@@ -112,23 +117,13 @@ export function getSql(): SqlTag {
     strings: TemplateStringsArray,
     ...values: unknown[]
   ): Promise<T[]> => {
-    const params: unknown[] = [];
-    const seen = new Map<unknown, number>();
+    // undefined 不是合法的 pg 參數，一律當成 NULL。
+    const params = values.map((value) => (value === undefined ? null : value));
 
     let text = "";
     for (let i = 0; i < strings.length; i += 1) {
       text += strings[i];
-      if (i < values.length) {
-        // undefined 不是合法的 pg 參數，一律當成 NULL。
-        const value = values[i] === undefined ? null : values[i];
-        let index = seen.get(value);
-        if (index === undefined) {
-          params.push(value);
-          index = params.length;
-          seen.set(value, index);
-        }
-        text += `$${index}`;
-      }
+      if (i < values.length) text += `$${i + 1}`;
     }
 
     const result = await pool.query(text, params);

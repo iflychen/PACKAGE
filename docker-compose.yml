@@ -21,7 +21,8 @@ services:
       timeout: 3s
       retries: 10
 
-  # Restore the bundled schema/data only when REALDB is still empty.
+  # Restore the bundled schema/data only when REALDB is still empty,
+  # then always apply dashboard/db/migrations/*.sql (idempotent scripts).
   database-init:
     image: postgres:18
     container_name: realdb_init
@@ -32,6 +33,7 @@ services:
     volumes:
       - ./REALDB_backup.dump:/backup/REALDB_backup.dump:ro
       - ./init-realdb.sh:/opt/init-realdb.sh:ro
+      - ./dashboard/db/migrations:/opt/migrations:ro
     depends_on:
       postgres:
         condition: service_healthy

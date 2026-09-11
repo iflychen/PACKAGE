@@ -1422,6 +1422,67 @@ body {
   .status-card strong { font-size: 17px; }
 }
 
+/* ---------------------------------------------------------------------------
+   Phase I 覆核紀錄
+   疑似異常點勾選排除後，就地展開排除原因下拉與備註欄。
+   --------------------------------------------------------------------------- */
+.trial-item-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 1px 0;
+}
+
+.review-fields {
+  display: flex;
+  gap: 4px;
+  padding: 0 0 3px 17px;
+}
+
+.review-fields select,
+.review-fields input {
+  font-size: 11px;
+  padding: 2px 4px;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  background: #fff;
+  min-width: 0;
+}
+
+.review-fields select {
+  flex: 0 1 150px;
+}
+
+.review-fields input {
+  flex: 1 1 auto;
+}
+
+.review-tag {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 10px;
+  line-height: 15px;
+  vertical-align: middle;
+}
+
+.review-tag.done {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.review-tag.pending {
+  background: #f1f5f9;
+  color: #64748b;
+}
+
+.flash.warn {
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  color: #92400e;
+}
+
 @media print {
   @page { size: A4 landscape; margin: 10mm; }
   html, body { overflow: visible !important; height: auto; background: #fff; }

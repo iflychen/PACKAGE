@@ -52,8 +52,8 @@ function parseReviewRequest(body: unknown): {
   });
   if (validationError) throw new Error(validationError);
 
-  const rawInterval = value.tool_interval_id;
-  const toolIntervalId =
+  const rawInterval = value.event_interval_id;
+  const eventIntervalId =
     typeof rawInterval === "number" && Number.isFinite(rawInterval)
       ? rawInterval
       : null;
@@ -66,7 +66,7 @@ function parseReviewRequest(body: unknown): {
       machine,
       feature_name: featureName,
       chart_type: chartType,
-      tool_interval_id: toolIntervalId,
+      event_interval_id: eventIntervalId,
     },
     point_id: pointId,
     baseline_disposition: disposition,

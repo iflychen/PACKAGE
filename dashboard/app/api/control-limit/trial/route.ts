@@ -7,7 +7,9 @@ import {
   type ControlLimitSelection,
 } from "@/lib/controlLimitWorkflow";
 import { getAutoCreateControlLimit } from "@/lib/config";
+import { syncTrialReviews } from "@/lib/db";
 import { getSpcApiBase } from "@/lib/spcClient";
+import type { TrialReviewRecord, TrialSignal } from "@/lib/trialReview";
 import type { ChartType } from "@/lib/types";
 import { DEFAULT_EVENT_TYPE } from "@/lib/types";
 
@@ -109,6 +111,57 @@ export async function POST(req: NextRequest) {
         })),
     ];
 
+    // 同一個 point_id 可能同時在上圖與下圖觸發。覆核表的主鍵是 point_id,
+    // 所以要先合併成一列,兩張圖的來源收進 sources 陣列。
+    //
+    // actual_value 取先遇到的那個 —— suspectedPoints 是上圖在前,所以只要
+    // 該點在上圖有觸發就會是量測值;只在下圖觸發的點拿到的是 MR/R/S 的值,
+    // 那正是它被判異常的依據,顯示上也合理。
+    const signalMap = new Map<string, TrialSignal>();
+    for (const point of suspectedPoints) {
+      const id = String(point.point_id);
+      const existing = signalMap.get(id);
+      if (existing) {
+        existing.violated_rules = Array.from(
+          new Set([...existing.violated_rules, ...point.violated_rules]),
+        );
+        existing.sources.push({
+          chart: point.chart,
+          component_type: point.component_type,
+        });
+      } else {
+        signalMap.set(id, {
+          point_id: id,
+          actual_value: point.actual_value,
+          violated_rules: [...point.violated_rules],
+          sources: [
+            { chart: point.chart, component_type: point.component_type },
+          ],
+        });
+      }
+    }
+
+    // 寫入覆核表。這裡刻意不讓失敗中斷試算 —— 若某個環境還沒跑過
+    // db/migrations 的建表腳本,試算與核准都應該照常可用,只是沒有覆核功能。
+    let reviews: TrialReviewRecord[] = [];
+    let reviewError: string | undefined;
+    try {
+      reviews = await syncTrialReviews(
+        {
+          product: selection.product,
+          process: selection.process,
+          machine: selection.machine,
+          feature_name: selection.feature_name,
+          chart_type: selection.chart_type,
+          event_interval_id: selection.event_interval_id ?? null,
+        },
+        Array.from(signalMap.values()),
+      );
+    } catch (err) {
+      reviewError = err instanceof Error ? err.message : String(err);
+      console.error("[trial] syncTrialReviews failed:", reviewError);
+    }
+
     const shouldAutoApprove =
       body.auto_approve_if_clean === true &&
       getAutoCreateControlLimit() &&
@@ -130,6 +183,8 @@ export async function POST(req: NextRequest) {
       excluded_point_ids: result.excluded_point_ids,
       trial: result.trial,
       suspected_points: suspectedPoints,
+      reviews,
+      review_error: reviewError,
       control_start_time: result.control_start_time,
       chart: result.chart,
     });

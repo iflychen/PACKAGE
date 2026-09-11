@@ -32,7 +32,8 @@ export interface TrialReviewKey {
   machine: string;
   feature_name: string;
   chart_type: ChartType;
-  tool_interval_id: number | null;
+  /** 事件區間 id；null 代表不分區間(DB 端以 -1 當哨兵值存放)。 */
+  event_interval_id: number | null;
 }
 
 export interface TrialSignal {
