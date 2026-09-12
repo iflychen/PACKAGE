@@ -11,8 +11,8 @@
 > | 情況 | 看哪份 | 現場要做什麼 |
 > | --- | --- | --- |
 > | 第一次、要從原始碼建置 | **本文件** | `docker compose up -d --build` |
-> | 正式部署，有網路 | [DEPLOY.md](DEPLOY.md) | 只 `pull` CI 建好的 image，不 build |
-> | 工廠機台、沒有外網或網路很慢 | [OFFLINE-INSTALL.md](OFFLINE-INSTALL.md) | USB 拷貝 + `docker load`，全程零網路 |
+> | 網路很慢 / 卡在 ghcr.io | **本文件 [8.1](#81選用網路太慢的話從-release-下載離線包)** | 從 Releases 下載離線包，跳過線上下載 |
+> | 工廠機台、完全沒有外網 | [OFFLINE-INSTALL.md](OFFLINE-INSTALL.md) | USB 拷貝 + `docker load`，全程零網路 |
 
 ---
 
@@ -25,7 +25,7 @@
 5. [步驟一：安裝 WSL2 與 Docker Desktop](#5-步驟一安裝-wsl2-與-docker-desktop)
 6. [步驟二：安裝 Git 並取得原始碼](#6-步驟二安裝-git-並取得原始碼)
 7. [步驟三：建立 `.env` 環境變數檔](#7-步驟三建立-env-環境變數檔)
-8. [步驟四：第一次啟動](#8-步驟四第一次啟動)
+8. [步驟四：第一次啟動](#8-步驟四第一次啟動)（含[從 Release 下載離線包](#81選用網路太慢的話從-release-下載離線包)）
 9. [步驟五：驗證部署是否成功](#9-步驟五驗證部署是否成功)
 10. [步驟六：第一次使用](#10-步驟六第一次使用)
 11. [環境變數完整說明](#11-環境變數完整說明)
@@ -390,10 +390,64 @@ docker compose up -d --build
 這一行會做完所有事情：拉映像、建置三個自製映像、啟動容器、下載模型、還原資料庫、安裝 Aniki Pipe。
 
 > **第一次啟動會很久。** 依網路速度，大約 **20 ～ 60 分鐘**。
-> 主要時間花在下載 11 GB 的 Ollama 模型。指令本身會很快回到命令提示字元
-> （因為有 `-d`），但背景還在忙，請用下一節的指令確認進度。
+> 主要時間花在下載 11 GB 的 Ollama 模型與 Docker 映像。指令本身會很快回到
+> 命令提示字元（因為有 `-d`），但背景還在忙，請用 [8.3](#83-追蹤第一次啟動的進度)
+> 的指令確認進度。
 
-### 8.1 啟動順序（compose 的依賴關係）
+### 8.1（選用）網路太慢的話：從 Release 下載離線包
+
+如果你遇到下面任何一種情況，可以跳過線上下載，改用預先打包好的離線包：
+
+- `ghcr.io` 下載極慢或卡住不動（實測過的問題，見 [14.11](#1411-ghcrio-下載極慢或卡在-0-bytes)）
+- 網路不穩，`docker compose up` 跑一半失敗要重來
+- 目標機器**完全沒有外網**（工廠機台常見）
+- 要一次裝好幾台，不想每台都重下一次
+
+**離線包放在這個 repo 的 [Releases](../../releases) 頁面**，標籤是 `offline-*`。
+
+#### 下載
+
+Release 附件單檔上限 2 GB，所以大檔是切成分割檔上傳的。
+**要把該 tag 底下的檔案全部下載到同一個資料夾**，一個都不能少：
+
+```text
+images.tar.gz.part00, part01, ...     所有 Docker 映像
+ollama_models.tar.part00, ...         11 GB 模型（只有部分版本才有）
+SHA256SUMS.txt                        校驗碼
+manifest.json                         版本與內容清單
+install-offline.ps1                   安裝腳本
+```
+
+用 GitHub CLI 一次抓完最省事：
+
+```powershell
+gh release download offline-v1.0.0 --dir E:undle
+```
+
+或到 Releases 頁面手動一個一個下載。
+
+#### 安裝
+
+```powershell
+cd <專案資料夾>
+E:\bundle\install-offline.ps1
+```
+
+腳本會驗證校驗碼 → 合併分割檔 → `docker load` → 還原模型 →
+提示填 `.env` → `docker compose up -d`。
+
+完成後直接跳到[步驟五驗證](#9-步驟五驗證部署是否成功)。
+
+> **注意：離線包裡只有映像和模型，沒有原始碼。** compose 還需要
+> `REALDB_backup.dump`、`init-realdb.sh`、`dashboard/db/migrations/`、
+> `pipelines/openwebui_*.py`、`ipqc/` 這些檔案，所以[步驟二](#6-步驟二安裝-git-並取得原始碼)
+> 還是要做——只是不用再等下載。
+>
+> 合併過程中會同時存在分割檔與合併後的大檔，**磁碟峰值需要約兩倍空間**。
+
+製作離線包的方法（要發布新版時用）寫在 [OFFLINE-INSTALL.md](OFFLINE-INSTALL.md)。
+
+### 8.2 啟動順序（compose 的依賴關係）
 
 ```text
 postgres ──(healthy)──► database-init ──(completed)──┬──► dashboard
@@ -412,7 +466,7 @@ ollama ──(healthy)──► ollama-model-init ──(completed)──┬─�
 
 所以第一次啟動時，`docker compose ps` 會看到一堆 `Created` / `waiting`，**這是正常的**。
 
-### 8.2 追蹤第一次啟動的進度
+### 8.3 追蹤第一次啟動的進度
 
 ```powershell
 # 看整體狀態
@@ -1366,20 +1420,18 @@ docker compose up -d --build
 
 ```text
 ipqc-spc-system/
-├─ docker-compose.yml          ← 開發／原始碼部署：本機 build 三個自製 image
-├─ docker-compose.prod.yml     ← 正式部署：只 pull CI 建好的 GHCR image
+├─ docker-compose.yml          ← 整套系統的定義，9 個服務都在這裡
 ├─ init-realdb.sh              ← 資料庫初始化腳本（還原 dump + 套用 migrations）
 ├─ REALDB_backup.dump          ← PostgreSQL 18.3 custom format dump（schema + 初始資料）
 ├─ .env.example                ← 環境變數範例，複製成 .env 再填
 ├─ .env                        ← ⚠️ 你要自己建立，已被 .gitignore 排除
 ├─ .gitattributes              ← 強制 .sh 為 LF，避免 Windows CRLF 讓容器起不來
 ├─ README.md                   ← 本文件：從零開始的完整部署
-├─ DEPLOY.md                   ← 正式部署：CI 建置、版本管理、穩定性設定
+├─ DEPLOY.md                   ← 部署與維運：CI 檢查、版本發布、穩定性設定
 ├─ OFFLINE-INSTALL.md          ← 離線安裝包：製作、上傳 Release、目標機器安裝
 │
 ├─ .github/workflows/
-│  ├─ ci.yml                   ← 快速檢查：typecheck / 語法 / compose / CRLF
-│  └─ build-images.yml         ← 建置三個 image 並推到 GHCR
+│  └─ ci.yml                   ← 快速檢查：typecheck / 語法 / compose / CRLF
 │
 ├─ scripts/
 │  ├─ pin-upstream-images.sh   ← 把上游 image 鎖定成 digest 寫回 .env
@@ -1593,7 +1645,7 @@ ipqc-spc-system/
 | 文件 | 內容 |
 | --- | --- |
 | [`OFFLINE-INSTALL.md`](OFFLINE-INSTALL.md) | ⭐ 離線安裝包：沒有外網的機器怎麼裝，含 GitHub 檔案大小限制與分割上傳 |
-| [`DEPLOY.md`](DEPLOY.md) | ⭐ 正式部署：CI 建置 + GHCR、版本發布與回退、log 輪替、image 鎖版、資料庫備份 |
+| [`DEPLOY.md`](DEPLOY.md) | ⭐ 部署與維運：CI 檢查、版本發布、log 輪替、image 鎖版、資料庫與模型備份 |
 | [`dashboard/HANDOFF.md`](dashboard/HANDOFF.md) | ⭐ 最重要的技術文件：schema 語意、SPC 規則範圍、Phase I/II 流程、各種「看起來對其實錯」的陷阱 |
 | [`dashboard/README.md`](dashboard/README.md) | 前端架構與功能說明 |
 | [`dashboard/DOCKER.md`](dashboard/DOCKER.md) | Dashboard 單獨建置與執行 |

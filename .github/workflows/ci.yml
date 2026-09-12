@@ -50,7 +50,7 @@ jobs:
         run: python -m compileall -q spc_model/app
 
   compose-validate:
-    name: Compose files valid
+    name: Compose file valid
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -61,10 +61,6 @@ jobs:
           DB_PASSWORD=ci ANIKI_API_KEY=ci \
             docker compose -f docker-compose.yml config --quiet
 
-      - name: Validate docker-compose.prod.yml
-        run: |
-          DB_PASSWORD=ci ANIKI_API_KEY=ci GHCR_OWNER=ci IMAGE_TAG=ci \
-            docker compose -f docker-compose.prod.yml config --quiet
 
   shell-lint:
     name: Shell scripts

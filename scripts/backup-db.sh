@@ -36,9 +36,7 @@ mkdir -p "$OUT_DIR"
 
 cd "$REPO_ROOT"
 
-# 用哪個 compose 檔都可以，postgres 服務定義是一樣的。
 COMPOSE_FILE="docker-compose.yml"
-[ -f "$COMPOSE_FILE" ] || COMPOSE_FILE="docker-compose.prod.yml"
 
 if ! docker compose -f "$COMPOSE_FILE" ps --status running --services 2>/dev/null | grep -qx postgres; then
     echo "postgres 容器沒有在執行，無法備份。" >&2

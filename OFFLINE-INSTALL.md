@@ -2,8 +2,8 @@
 
 給**沒有外網、或網路不穩**的機器用。整套系統從零安裝完成，全程不需要連外。
 
-> 一般有網路的環境請看 [README.md](README.md)（從原始碼建置）或
-> [DEPLOY.md](DEPLOY.md)（從 GHCR 拉預先建好的 image）。
+> 一般有網路的環境請看 [README.md](README.md)（從原始碼建置）。
+> 長期維運與版本發布見 [DEPLOY.md](DEPLOY.md)。
 
 ---
 
