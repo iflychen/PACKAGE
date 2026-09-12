@@ -1,20 +1,27 @@
 # =============================================================================
-#  開發／原始碼部署用 compose
+#  正式部署用 compose —— 只 pull，不 build
 #  ---------------------------------------------------------------------------
-#  這個檔會「在本機從原始碼 build」三個自製 image：
-#      docker compose up -d --build
+#  三個自製 image 由 GitHub Actions 建好推到 GHCR，這裡直接拉下來用。
+#  部署機器不需要 Node.js、Python 工具鏈，也不會因為 npm / pip 套件漂移而失敗。
 #
-#  正式部署請改用 docker-compose.prod.yml —— 它只 pull CI 建好的 image，
-#  不需要 Node / Python 工具鏈，也不會因為套件版本漂移而失敗。
-#  詳見 DEPLOY.md。
+#  用法：
+#      cp .env.example .env      # 填 DB_PASSWORD / ANIKI_API_KEY
+#      # 再補上這兩行（CI 的 Actions Summary 會直接給你）：
+#      #   GHCR_OWNER=<你的 github 帳號，全小寫>
+#      #   IMAGE_TAG=1.0.0
+#      docker compose -f docker-compose.prod.yml pull
+#      docker compose -f docker-compose.prod.yml up -d
+#
+#  回退到上一版：把 .env 的 IMAGE_TAG 改掉，重跑上面兩行即可。
+#
+#  注意：這個檔仍然需要 repo 裡的幾個檔案（bind mount）：
+#      REALDB_backup.dump / init-realdb.sh / dashboard/db/migrations/
+#      pipelines/openwebui_*.py / ipqc/
+#  所以部署機器還是要 clone 這個 repo —— 只是不用再 build。
 # =============================================================================
 
 name: real-project
 
-# --- 共用設定：log 輪替 -------------------------------------------------------
-#  沒有這段的話，長期運轉的容器（尤其 ollama 與 pipelines）會把 json log
-#  一直往磁碟寫，幾個月後把硬碟塞爆 —— 工廠機台最常見的死法。
-#  每個容器上限 10MB x 3 個檔 = 30MB。
 x-logging: &default-logging
   driver: json-file
   options:
@@ -29,7 +36,7 @@ services:
     logging: *default-logging
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${DB_PASSWORD:?請在專案根目錄建立 .env 並設定 DB_PASSWORD}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?請在 .env 設定 DB_PASSWORD}
       POSTGRES_DB: REALDB
     ports:
       - "5431:5432"
@@ -43,8 +50,6 @@ services:
       timeout: 3s
       retries: 10
 
-  # Restore the bundled schema/data only when REALDB is still empty,
-  # then always apply dashboard/db/migrations/*.sql (idempotent scripts).
   database-init:
     image: ${POSTGRES_IMAGE:-postgres:18}
     container_name: realdb_init
@@ -52,7 +57,7 @@ services:
     logging: *default-logging
     entrypoint: ["/bin/sh", "/opt/init-realdb.sh"]
     environment:
-      PGPASSWORD: ${DB_PASSWORD:?請在專案根目錄建立 .env 並設定 DB_PASSWORD}
+      PGPASSWORD: ${DB_PASSWORD:?請在 .env 設定 DB_PASSWORD}
     volumes:
       - ./REALDB_backup.dump:/backup/REALDB_backup.dump:ro
       - ./init-realdb.sh:/opt/init-realdb.sh:ro
@@ -77,7 +82,7 @@ services:
       ENABLE_PLUGINS: "true"
       DEFAULT_MODELS: aniki
       ANIKI_API_URL: http://pipelines:8000
-      ANIKI_API_KEY: ${ANIKI_API_KEY:?請在專案根目錄建立 .env 並設定 ANIKI_API_KEY}
+      ANIKI_API_KEY: ${ANIKI_API_KEY:?請在 .env 設定 ANIKI_API_KEY}
     depends_on:
       ollama-model-init:
         condition: service_completed_successfully
@@ -102,8 +107,7 @@ services:
       retries: 30
     networks:
       - project_network
-    # --- NVIDIA GPU 加速（選用）---------------------------------------------
-    # 主機裝好驅動與 NVIDIA Container Toolkit 之後，取消下面註解可大幅加速辨識。
+    # NVIDIA GPU 加速（選用）：見 docker-compose.yml 內的同段註解。
     # deploy:
     #   resources:
     #     reservations:
@@ -112,7 +116,6 @@ services:
     #           count: all
     #           capabilities: [gpu]
 
-  # Pull required models once. Existing Ollama layers are reused on later starts.
   ollama-model-init:
     image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
     container_name: ollama_model_init
@@ -131,12 +134,8 @@ services:
     networks:
       - project_network
 
-  # Python SPC calculation and AI summary service.
-  # No host port is published because pipelines already uses host port 8000.
-  # Other containers reach this service through http://spc-api:8000.
   spc-api:
-    build: ./spc_model
-    image: spc-model:local
+    image: ghcr.io/${GHCR_OWNER:?請在 .env 設定 GHCR_OWNER}/spc-model:${IMAGE_TAG:-latest}
     container_name: spc_api
     restart: always
     logging: *default-logging
@@ -144,7 +143,6 @@ services:
       - "8000"
     environment:
       OLLAMA_BASE_URL: http://ollama:11434
-      # 和 ollama-model-init 下載的模型用同一個變數，兩邊不會再對不上。
       OLLAMA_MODEL: ${SPC_OLLAMA_MODEL:-qwen2.5:7b}
     depends_on:
       ollama-model-init:
@@ -159,8 +157,7 @@ services:
       - project_network
 
   dashboard:
-    build: ./dashboard
-    image: spc-dashboard:local
+    image: ghcr.io/${GHCR_OWNER:?請在 .env 設定 GHCR_OWNER}/spc-dashboard:${IMAGE_TAG:-latest}
     container_name: spc_dashboard
     restart: always
     logging: *default-logging
@@ -176,8 +173,6 @@ services:
         condition: service_completed_successfully
       spc-api:
         condition: service_healthy
-    # 用 node 而不是 curl/wget 做健康檢查：final image 是 node:20-alpine，
-    # node 一定在，curl 不一定在。
     healthcheck:
       test:
         - CMD
@@ -192,8 +187,7 @@ services:
       - project_network
 
   pipelines:
-    build: ./pipelines
-    image: aniki-pipelines:local
+    image: ghcr.io/${GHCR_OWNER:?請在 .env 設定 GHCR_OWNER}/aniki-pipelines:${IMAGE_TAG:-latest}
     container_name: aniki_pipelines
     restart: always
     logging: *default-logging
@@ -201,7 +195,7 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@postgres:5432/REALDB
-      ANIKI_API_KEY: ${ANIKI_API_KEY:?請在專案根目錄建立 .env 並設定 ANIKI_API_KEY}
+      ANIKI_API_KEY: ${ANIKI_API_KEY:?請在 .env 設定 ANIKI_API_KEY}
       OLLAMA_URL: http://ollama:11434/api/chat
       VLM_MODEL: ${VLM_MODEL:-qwen2.5vl:7b}
       VLM_RECHECK_MODEL: ${VLM_MODEL:-qwen2.5vl:7b}
@@ -219,8 +213,6 @@ services:
     networks:
       - project_network
 
-  # Open WebUI stores Functions in its database. This idempotent one-shot
-  # installer keeps Aniki present and active even with an existing data volume.
   aniki-openwebui-init:
     image: ${PYTHON_INIT_IMAGE:-python:3.12-slim}
     container_name: aniki_openwebui_init

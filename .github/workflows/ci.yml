@@ -1,0 +1,95 @@
+# =============================================================================
+#  快速檢查 —— 在花時間 build image 之前先擋掉明顯的錯誤
+#  ---------------------------------------------------------------------------
+#  刻意保持「快」：不裝 Python 相依套件、不跑 next build。
+#  目的是 30 秒內告訴你「有沒有打錯字」，不是完整測試。
+# =============================================================================
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  dashboard-typecheck:
+    name: Dashboard typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - run: npm ci
+        working-directory: dashboard
+
+      - run: npm run typecheck
+        working-directory: dashboard
+
+  python-syntax:
+    name: Python syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # compileall 只檢查語法，不 import，所以不需要裝 fastapi / PyMuPDF。
+      - name: Compile pipelines
+        run: python -m compileall -q pipelines
+
+      - name: Compile spc_model
+        run: python -m compileall -q spc_model/app
+
+  compose-validate:
+    name: Compose files valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # compose 需要變數才能展開，給假值即可 —— 這裡只驗語法。
+      - name: Validate docker-compose.yml
+        run: |
+          DB_PASSWORD=ci ANIKI_API_KEY=ci \
+            docker compose -f docker-compose.yml config --quiet
+
+      - name: Validate docker-compose.prod.yml
+        run: |
+          DB_PASSWORD=ci ANIKI_API_KEY=ci GHCR_OWNER=ci IMAGE_TAG=ci \
+            docker compose -f docker-compose.prod.yml config --quiet
+
+  shell-lint:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      # 只有真正的 error 才擋 CI。init-realdb.sh 裡有刻意的 word splitting
+      # （PSQL="psql --host=..." 之後不加引號展開），那是 warning 不是 bug。
+      - name: shellcheck (gating)
+        run: shellcheck --severity=error init-realdb.sh scripts/*.sh
+
+      # warning 以上只印出來參考，不擋 CI。
+      - name: shellcheck (advisory)
+        continue-on-error: true
+        run: shellcheck --severity=warning init-realdb.sh scripts/*.sh
+
+      # Windows 使用者最常踩的雷：CRLF 讓容器找不到 /bin/sh。
+      - name: Reject CRLF in shell scripts
+        run: |
+          if grep -rlU $'\r' --include='*.sh' .; then
+            echo "::error::上面的 .sh 檔含 CRLF 換行，會讓容器內 shell 無法執行"
+            exit 1
+          fi
+          echo "所有 .sh 都是 LF，OK"

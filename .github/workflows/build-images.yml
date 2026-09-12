@@ -1,0 +1,122 @@
+# =============================================================================
+#  建置三個自製 image 並推送到 GitHub Container Registry (GHCR)
+#  ---------------------------------------------------------------------------
+#  目的：把「在使用者機器上 build」變成「在 CI build 一次，現場只 pull」。
+#
+#  觸發時機：
+#    - push 到 main          → 產生 edge 與 sha-xxxxxxx 標籤
+#    - push tag v*.*.*       → 產生 1.2.3 / 1.2 / 1 / latest 標籤
+#    - 手動 (workflow_dispatch)
+#
+#  產出（<owner> 由 repo 自動帶入，不寫死帳號）：
+#    ghcr.io/<owner>/spc-dashboard
+#    ghcr.io/<owner>/aniki-pipelines
+#    ghcr.io/<owner>/spc-model
+#
+#  要發布新版本時：
+#    git tag v1.0.0 && git push origin v1.0.0
+# =============================================================================
+
+name: build-images
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+    # 刻意不加 paths 過濾。GitHub 的 paths 會同時套用到 tag push，
+    # 而 tag 常常指向一個「已經 push 過」的 commit（沒有新變更），
+    # 這時 workflow 會被直接略過 —— 也就是你下了 v1.0.0 卻沒有 image。
+    # 重複建置的成本由下面的 GHA layer cache 吸收，通常一分鐘內完成。
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      # 推 image 到 GHCR 需要這個權限，少了會是 403。
+      packages: write
+
+    strategy:
+      # 一個服務失敗不要中斷其他兩個，才看得出到底壞幾個。
+      fail-fast: false
+      matrix:
+        include:
+          - name: spc-dashboard
+            context: ./dashboard
+          - name: aniki-pipelines
+            context: ./pipelines
+          - name: spc-model
+            context: ./spc_model
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # buildx 才有 GitHub Actions cache 後端可用。
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN 由 Actions 自動提供，不需要自己建 secret。
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # metadata-action 會自動把 owner 轉小寫（GHCR 只吃小寫路徑）。
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=ref,event=branch
+            type=sha,format=short
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.name }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          # 目標機器是 x86 工控機 / PC。要讓 Apple Silicon 也能原生跑，
+          # 改成 linux/amd64,linux/arm64 —— 但建置時間大約會變兩倍。
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          # 讓下一次建置重用 layer，改一行程式碼不用整包重跑。
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  # 三個 image 都成功之後才印出部署指引，避免半套版本被拿去部署。
+  summary:
+    needs: build
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: Print deploy hint
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          {
+            echo "### Image 已推送到 GHCR"
+            echo ""
+            echo '```env'
+            echo "GHCR_OWNER=${OWNER}"
+            echo "IMAGE_TAG=${GITHUB_REF_NAME#v}"
+            echo '```'
+            echo ""
+            echo "部署端執行：\`docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d\`"
+          } >> "$GITHUB_STEP_SUMMARY"

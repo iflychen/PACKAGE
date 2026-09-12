@@ -6,6 +6,14 @@
 > 主線以 **Windows 10 / 11 + WSL2 + Docker Desktop** 撰寫，
 > macOS 與 Linux 的差異另外寫在 [附錄 A](#附錄-amacos--linux-的差異)。
 
+> **三種安裝方式，看你的情況選：**
+>
+> | 情況 | 看哪份 | 現場要做什麼 |
+> | --- | --- | --- |
+> | 第一次、要從原始碼建置 | **本文件** | `docker compose up -d --build` |
+> | 正式部署，有網路 | [DEPLOY.md](DEPLOY.md) | 只 `pull` CI 建好的 image，不 build |
+> | 工廠機台、沒有外網或網路很慢 | [OFFLINE-INSTALL.md](OFFLINE-INSTALL.md) | USB 拷貝 + `docker load`，全程零網路 |
+
 ---
 
 ## 目錄
@@ -282,8 +290,8 @@ git --version
 ```powershell
 mkdir C:\projects
 cd C:\projects
-git clone https://github.com/iflychen/PACKAGE.git
-cd PACKAGE
+git clone https://github.com/<你的帳號>/ipqc-spc-system.git
+cd ipqc-spc-system
 ```
 
 確認檔案都在：
@@ -299,9 +307,10 @@ dir
 > 這是資料庫的 schema 與初始資料，少了它 `database-init` 會失敗，
 > Dashboard 與 Pipelines 都起不來。
 >
-> **注意換行字元。** `init-realdb.sh` 是要在 Linux 容器內執行的 shell script。
-> 如果你的 Git 設定把它轉成 CRLF，容器會報 `no such file or directory`。
-> 解法見 [疑難排解 14.7](#147-init-realdbsh-報-no-such-file-or-directory)。
+> **換行字元已由 `.gitattributes` 處理。** `init-realdb.sh` 要在 Linux 容器內執行，
+> 一旦被轉成 CRLF 就會報 `no such file or directory`。repo 內的 `.gitattributes`
+> 已經把所有 `.sh` 鎖成 LF，正常 clone 不會有問題。
+> 萬一還是遇到，解法見 [疑難排解 14.7](#147-database-init-一直-restarting或報-no-such-file-or-directory)。
 
 ---
 
@@ -309,7 +318,13 @@ dir
 
 `docker-compose.yml` 需要兩個**沒有預設值**的變數，必須自己建立。
 
-在**專案根目錄**（和 `docker-compose.yml` 同一層）新增一個檔名為 `.env` 的檔案：
+最快的做法是直接複製範例檔：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+然後編輯 `.env`。完整內容與說明如下：
 
 ```env
 # ===========================================================================
@@ -649,10 +664,10 @@ http://localhost:8000/review/<token>
 | `SPC_OLLAMA_MODEL` | ⬜ | `qwen2.5:7b` | `ollama-model-init` 要額外下載的模型 |
 | `SETTINGS_PASSWORD` | ⬜ | `spc1234` | Dashboard 設定對話框的密碼 |
 
-> ⚠️ **已知不一致：** `SPC_OLLAMA_MODEL` 只影響 `ollama-model-init` **下載**哪個模型；
-> `spc-api` 服務的 `OLLAMA_MODEL` 在 `docker-compose.yml` 裡是**寫死的 `qwen2.5:7b`**。
-> 如果你把 `SPC_OLLAMA_MODEL` 改成別的模型，記得同步修改 `docker-compose.yml` 中
-> `spc-api` 的 `OLLAMA_MODEL`，否則 AI 摘要會找不到模型。
+> ✅ `SPC_OLLAMA_MODEL` 現在同時決定 `ollama-model-init` **下載**哪個模型、
+> 以及 `spc-api` 實際**呼叫**哪個模型，兩邊不會再對不上。
+> （舊版把 `spc-api` 的 `OLLAMA_MODEL` 寫死成 `qwen2.5:7b`，改 `.env` 只會下載新模型，
+> AI 摘要仍然去呼叫舊的然後失敗。）
 
 ### 11.2 各服務實際收到的環境變數（由 compose 注入，不需要手動設定）
 
@@ -809,6 +824,69 @@ docker volume ls | findstr real-project
 `./ipqc` 是**主機資料夾的 bind mount**，不是 volume。上傳到 Open WebUI 的檔案會
 存進這裡，直接在檔案總管就看得到。
 
+### 12.7 Ollama 模型存在哪裡
+
+這是最常被問的一題，因為那 11 GB 找不到人。
+
+| 層次 | 位置 |
+| --- | --- |
+| 容器內路徑 | `/root/.ollama`（Ollama 預設；本專案沒有覆寫 `OLLAMA_MODELS`） |
+| Docker volume | `real-project_ollama_data` |
+| Windows 實體檔案 | 在 WSL2 的虛擬磁碟裡：`%LOCALAPPDATA%\Docker\wsl\disk\docker_data.vhdx`（未改過位置時） |
+
+volume 內部結構：
+
+```text
+/root/.ollama/
+├─ models/
+│  ├─ blobs/          ← 真正的權重檔，11 GB 幾乎都在這
+│  └─ manifests/registry.ollama.ai/library/
+│     ├─ qwen2.5vl/7b
+│     └─ qwen2.5/7b
+├─ id_ed25519
+└─ id_ed25519.pub
+```
+
+**它不在專案資料夾，也不在 `C:\Users\你\.ollama`**（那是原生安裝 Ollama 才會用的路徑）。
+Docker volume 住在 WSL2 的 vhdx 內部，檔案總管打不開。
+
+檢查：
+
+```powershell
+docker system df -v | findstr ollama_data
+docker compose exec ollama sh -c "du -sh /root/.ollama/models"
+docker compose exec ollama ollama list
+```
+
+### 12.8 備份與還原 Ollama 模型
+
+重灌、搬機器、或交付到廠內那台時，這一步能省掉 11 GB 的下載——在網路不穩的
+環境裡差別非常大。
+
+```powershell
+# 匯出（預設寫到 E:\docker-backup\ollama_models.tar）
+.\scripts\ollama-models.ps1 -Action export
+
+# 指定位置
+.\scripts\ollama-models.ps1 -Action export -Path D:\backup\models.tar
+
+# 還原
+.\scripts\ollama-models.ps1 -Action import
+```
+
+macOS / Linux：
+
+```bash
+./scripts/ollama-models.sh export
+./scripts/ollama-models.sh import
+```
+
+還原之後 `docker compose up -d`，`ollama-model-init` 會發現模型已存在而跳過下載。
+
+> **tar 檔不要放在 repo 資料夾裡。** 11 GB 的檔案誤 commit 會很麻煩。
+> `.gitignore` 已經擋掉 `*.tar`，但放在 repo 外面更保險。
+> 也不要放 C 槽——那通常正是你想騰出空間的那一顆。
+
 ---
 
 ## 13. 日常維運指令
@@ -927,6 +1005,9 @@ docker compose logs database-init
 
 ### 14.4 模型下載卡住或失敗
 
+> 先看 [14.12](#1412-docker-compose-up-停在-waiting-不動)——`compose up` 停在
+> `Waiting` 通常不是卡住，是模型正在下載但進度沒顯示出來。
+
 ```powershell
 docker compose logs -f ollama-model-init
 ```
@@ -964,18 +1045,80 @@ Open WebUI 的 Aniki Pipe 拿到的 key 和 Pipelines 的不一樣。
 3. 在 Open WebUI 的 **Workspace → Functions → aniki → Valves**，
    確認 `API_KEY` 欄位與 `.env` 一致（手動改過 Valves 的話，環境變數不會覆蓋它）。
 
-### 14.7 `init-realdb.sh` 報 `no such file or directory`
+### 14.7 `database-init` 一直 `Restarting`，或報 `no such file or directory`
 
-這是 **Windows CRLF 換行**造成的經典問題——Windows 版 Git 預設
-`core.autocrlf=true`，clone 下來的 `init-realdb.sh` 第一行會變成 `#!/bin/sh\r`，
-容器裡的 shell 找不到 `/bin/sh\r` 這個直譯器。
+**這是實際發生過、最花時間的一個坑。**
 
-**解法一（最快）：** 用 VS Code 開啟 `init-realdb.sh`，
-點右下角狀態列的 `CRLF`，改成 **`LF`**，存檔，然後：
+典型症狀是 `docker compose up` 永遠停在：
+
+```text
+- Container realdb_init  Waiting     768.1s
+```
+
+而 `docker compose ps -a` 顯示：
+
+```text
+realdb_init   postgres:18   ...   Restarting (2) 11 seconds ago
+```
+
+**退出碼 2 = psql 連線失敗。** `restart: on-failure` 讓它不斷重啟，
+compose 的 `service_completed_successfully` 就永遠等不到，
+`pipelines` / `openwebui` / `dashboard` 全部卡在 `Created`。
+
+根因幾乎都是 **Windows CRLF 換行**。Windows 版 Git 預設 `core.autocrlf=true`，
+`init-realdb.sh` 每一行結尾會多一個 `\r`，於是
+
+```sh
+PSQL="psql --host=postgres --username=postgres --dbname=REALDB"
+```
+
+變成 `--dbname=REALDB\r`，psql 去找一個叫 `REALDB\r` 的資料庫 → 連不上 → exit 2。
+
+> repo 內的 `.gitattributes` 已經把所有 `.sh` 鎖成 LF，正常 clone 不會有這個問題。
+> 這一節是給「從舊版複製過來」或「.gitattributes 被移除」的情況用的。
+
+**先確認是不是這個原因：**
 
 ```powershell
-docker compose up -d --force-recreate database-init
+foreach ($f in @("init-realdb.sh", ".env")) {
+  $b = [System.IO.File]::ReadAllBytes("$PWD\$f")
+  "{0,-20} {1}" -f $f, $(if ($b -contains 13) { "含 CR (CRLF) ← 有問題" } else { "純 LF 正常" })
+}
 ```
+
+`.env` 也要檢查——它若是 CRLF，`DB_PASSWORD` 的值結尾會多一個 `\r`，
+那是另一種造成 exit 2 的方式。
+
+**修正：**
+
+```powershell
+foreach ($f in @("init-realdb.sh", ".env")) {
+  $p = "$PWD\$f"
+  $t = [System.IO.File]::ReadAllText($p) -replace "`r`n", "`n"
+  [System.IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding $false))
+}
+
+docker compose up -d --force-recreate database-init
+docker compose logs -f database-init
+```
+
+成功會看到：
+
+```text
+REALDB is empty; restoring /backup/REALDB_backup.dump
+REALDB restore completed
+applying migration 20260904_phase_i_trial_review.sql
+CREATE TABLE
+CREATE INDEX
+DO
+migrations completed
+```
+
+看到 `migrations completed` 就結束了。**`logs -f` 會繼續掛著等新日誌，
+畫面不動是正常的**，按 `Ctrl+C` 離開，然後 `docker compose up -d` 把其餘服務帶起來。
+
+**也可以用 VS Code 改：** 開啟 `init-realdb.sh`，點右下角狀態列的 `CRLF`
+改成 **`LF`**，存檔，再 `docker compose up -d --force-recreate database-init`。
 
 **解法二（一勞永逸）：** 改設定後重新 clone。
 
@@ -983,8 +1126,8 @@ docker compose up -d --force-recreate database-init
 git config --global core.autocrlf input
 cd ..
 rmdir /s /q PACKAGE
-git clone https://github.com/iflychen/PACKAGE.git
-cd PACKAGE
+git clone https://github.com/<你的帳號>/ipqc-spc-system.git
+cd ipqc-spc-system
 ```
 
 （`.env` 記得重新建立。）
@@ -1025,7 +1168,188 @@ docker system df          # 看用掉多少
 docker system prune -a    # ⚠️ 清掉所有未使用的映像與快取（不會動到 volume）
 ```
 
-### 14.11 全部砍掉重來
+### 14.11 `ghcr.io` 下載極慢或卡在 0 bytes
+
+**這是實際遇到過的問題，而且不是你機器的錯。**
+
+症狀：`docker pull` Docker Hub 的 image（例如 `python:3.12-slim`）十秒內完成，
+但 `ghcr.io/open-webui/open-webui:main` 跑幾百秒還停在 0 bytes 或個位數 MB。
+
+先確認確實是 ghcr 而不是你這邊：
+
+```powershell
+# 主機頻寬
+Measure-Command { curl.exe -o NUL -s https://speed.cloudflare.com/__down?bytes=50000000 }
+
+# Docker Hub 的 image 多快
+docker rmi python:3.12-slim -f
+Measure-Command { docker pull python:3.12-slim }
+```
+
+主機頻寬正常、Docker Hub 的 image 也快，只有 ghcr 慢 → 就是 ghcr 的問題。
+GitHub 社群長期有這個回報，跟你的網路、防毒、CPU 都無關。
+
+**解法，由易到難：**
+
+1. **換 DNS** — CDN 依 DNS 結果分配節點，換一個常常會拿到不同 POP。
+   Docker Desktop → Settings → Docker Engine：
+
+   ```json
+   {
+     "max-concurrent-downloads": 1,
+     "dns": ["1.1.1.1", "8.8.8.8"]
+   }
+   ```
+
+2. **單獨 pull，不要用 `compose up` 一次拉四顆** — 並行下載會互相搶頻寬並逾時重試：
+
+   ```powershell
+   docker pull postgres:18
+   docker pull ollama/ollama
+   docker pull ghcr.io/open-webui/open-webui:main
+   docker pull python:3.12-slim
+   docker compose up -d --build
+   ```
+
+   中斷了直接重跑同一行，**已完成的 layer 會保留**，只有中斷當下那一層重來。
+
+3. **換網路試一次** — 手機熱點三十秒就能判斷是不是 ISP 到 GitHub CDN 的路由問題。
+
+4. **在別的機器拉，USB 搬過來**（最可靠）：
+
+   ```powershell
+   # 網路順的機器
+   docker pull ghcr.io/open-webui/open-webui:main
+   docker save ghcr.io/open-webui/open-webui:main -o openwebui.tar
+
+   # 目標機器
+   docker load -i openwebui.tar
+   ```
+
+> Docker Hub 上有非官方的 open-webui 鏡像。**官方只發佈在 ghcr.io**，
+> 真要用第三方鏡像，先比對 digest 確認內容一致再用：
+> `docker manifest inspect <image> | Select-String digest`
+
+### 14.12 `docker compose up` 停在 `Waiting` 不動
+
+大多數情況**這是正常的**，不是卡住。
+
+```text
+- Container ollama_model_init  Waiting     685.6s
+```
+
+`Waiting` 的意思是 compose 在等那個容器**執行完畢**（因為別的服務宣告了
+`service_completed_successfully`）。`ollama_model_init` 此刻正在下載 11 GB 的模型，
+而 compose 的進度列不會顯示容器內部的下載進度。
+
+**看真實進度：**
+
+```powershell
+docker compose logs -f ollama-model-init
+
+# 或看模型資料夾長多大，每分鐘應該往上跳
+docker compose exec ollama sh -c "du -sh /root/.ollama/models"
+```
+
+**怎麼分辨真的卡住了：**
+
+```powershell
+docker compose ps -a
+```
+
+| 狀態 | 意義 |
+| --- | --- |
+| `Exited (0)` | 成功，後面的服務會自動接著起來 |
+| `Up` 但 `du -sh` 的數字 5 分鐘不動 | 下載卡住，`docker compose up -d --force-recreate ollama-model-init` |
+| `Restarting (n)` | **真的失敗了**，看 logs 找原因（`database-init` 見 [14.7](#147-database-init-一直-restarting或報-no-such-file-or-directory)） |
+
+前景那個 `docker compose up` 可以直接 `Ctrl+C`，容器在背景繼續跑。
+
+### 14.13 Docker Desktop 搬移磁碟位置失敗
+
+C 槽空間不足想把 Docker 資料搬到別的磁碟時，
+**Settings → Resources → Advanced → Disk image location** 有時會直接顯示失敗。
+
+**先試最簡單的：** 托盤圖示 → Quit Docker Desktop（完全退出，不是關視窗），
+然後 `wsl --shutdown`，再重試 GUI。大部分的失敗都是因為 vhdx 還被鎖著。
+
+**不要手動搬 vhdx。** `docker_data.vhdx` 搬過去、改設定檔的 `DataFolder` 之後，
+`docker-desktop` 這個 WSL distro 的註冊路徑仍記在登錄檔裡沒有跟著改，
+Docker 會一邊從舊位置開 distro、一邊到新位置找資料磁碟，結果就是**永遠停在 starting**。
+（backend log 會出現 `still waiting for init control API to respond`。）
+
+**可靠的做法是重建：**
+
+1. 備份模型與資料庫（[12.8](#128-備份與還原-ollama-模型) 與 [12.5](#125-備份與還原)）
+2. 解除安裝 Docker Desktop，清掉殘留：
+
+   ```powershell
+   Stop-Service com.docker.service -Force -EA SilentlyContinue
+   Get-Process "Docker Desktop","com.docker.backend","com.docker.build","docker-sandbox" `
+       -EA SilentlyContinue | Stop-Process -Force
+   wsl --shutdown
+   Start-Sleep -Seconds 10
+
+   wsl -l -v                        # 先看清楚有哪些 distro
+   wsl --unregister docker-desktop  # ⚠️ 只打 docker-desktop，不要碰其他 distro
+
+   foreach ($p in @("$env:LOCALAPPDATA\Docker","$env:APPDATA\Docker","$env:APPDATA\Docker Desktop",
+                    "$env:USERPROFILE\.docker","$env:ProgramData\Docker","$env:ProgramData\DockerDesktop")) {
+     if (Test-Path $p) { Remove-Item $p -Recurse -Force }
+   }
+   ```
+
+   `docker_data.vhdx` 刪不掉、報「正由另一個處理序使用」時，直接重開機再刪。
+
+3. 重新安裝 Docker Desktop
+4. **第一次啟動後、拉任何 image 之前**，先到 Settings → Resources → Advanced
+   把位置設到目標磁碟（此時完全沒有資料，必定成功）
+5. 還原模型與資料庫
+
+驗證真的搬過去了：
+
+```powershell
+Get-ChildItem "<新位置>" -Recurse -Filter *.vhdx |
+  Select-Object FullName, @{n='GB';e={[math]::Round($_.Length/1GB,2)}}
+
+Get-ChildItem "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Lxss" |
+  ForEach-Object { Get-ItemProperty $_.PSPath } |
+  Select-Object DistributionName, BasePath | Format-Table -AutoSize
+```
+
+`docker-desktop` 的 `BasePath` 要指向新位置。
+
+### 14.14 下載慢，但不是 ghcr 的問題
+
+依序排除（每一項都能單獨驗證）：
+
+| 嫌疑 | 怎麼查 | 怎麼修 |
+| --- | --- | --- |
+| 防毒即時掃描 vhdx | `(Get-MpPreference).ExclusionPath` 裡有沒有 Docker 的資料路徑 | 見下方 |
+| 系統 proxy | `docker info` 的 `HTTP Proxy` 行；`netsh winhttp show proxy` | Docker Desktop → Settings → Resources → **Proxies** 明確關掉 |
+| CPU 被佔滿 | `Get-CimInstance Win32_Processor \| Select LoadPercentage` | 找出吃資源的程序 |
+| 並行下載互搶 | — | `max-concurrent-downloads: 1` |
+
+**加 Defender 排除（系統管理員）：**
+
+```powershell
+Add-MpPreference -ExclusionPath "<Docker 資料磁碟所在資料夾>"
+Add-MpPreference -ExclusionProcess "com.docker.backend.exe"
+Add-MpPreference -ExclusionProcess "com.docker.build.exe"
+Add-MpPreference -ExclusionProcess "vmmem.exe"
+Add-MpPreference -ExclusionProcess "vmmemWSL.exe"
+Add-MpPreference -ExclusionProcess "wslservice.exe"
+
+(Get-MpPreference).ExclusionPath
+```
+
+> **搬過磁碟位置的話一定要重加。** Docker Desktop 安裝時加的排除指向原本的
+> `%LOCALAPPDATA%\Docker`，搬到新磁碟之後那條規則就失效了。
+>
+> 順帶一提：檢查排除清單時如果看到 `C:\Windows\system32` 或 `powershell.EXE`
+> 被排除，那**不是正常設定**，是惡意或流氓軟體常用的手法，建議移除並做一次掃描。
+
+### 14.15 全部砍掉重來
 
 ```powershell
 docker compose down -v
@@ -1033,18 +1357,37 @@ docker compose up -d --build
 ```
 
 `-v` 會刪掉**所有 volume**：資料庫、模型、Open WebUI 帳號全部消失，
-模型要重新下載 11 GB。執行前請先備份（見 [12.5](#125-備份與還原)）。
+模型要重新下載 11 GB。執行前請先備份資料庫（[12.5](#125-備份與還原)）
+與模型（[12.8](#128-備份與還原-ollama-模型)）。
 
 ---
 
 ## 15. 專案目錄結構
 
 ```text
-PACKAGE/
-├─ docker-compose.yml          ← 整套系統的唯一進入點，9 個服務都定義在這裡
+ipqc-spc-system/
+├─ docker-compose.yml          ← 開發／原始碼部署：本機 build 三個自製 image
+├─ docker-compose.prod.yml     ← 正式部署：只 pull CI 建好的 GHCR image
 ├─ init-realdb.sh              ← 資料庫初始化腳本（還原 dump + 套用 migrations）
 ├─ REALDB_backup.dump          ← PostgreSQL 18.3 custom format dump（schema + 初始資料）
+├─ .env.example                ← 環境變數範例，複製成 .env 再填
 ├─ .env                        ← ⚠️ 你要自己建立，已被 .gitignore 排除
+├─ .gitattributes              ← 強制 .sh 為 LF，避免 Windows CRLF 讓容器起不來
+├─ README.md                   ← 本文件：從零開始的完整部署
+├─ DEPLOY.md                   ← 正式部署：CI 建置、版本管理、穩定性設定
+├─ OFFLINE-INSTALL.md          ← 離線安裝包：製作、上傳 Release、目標機器安裝
+│
+├─ .github/workflows/
+│  ├─ ci.yml                   ← 快速檢查：typecheck / 語法 / compose / CRLF
+│  └─ build-images.yml         ← 建置三個 image 並推到 GHCR
+│
+├─ scripts/
+│  ├─ pin-upstream-images.sh   ← 把上游 image 鎖定成 digest 寫回 .env
+│  ├─ backup-db.sh             ← REALDB 備份 + 自動輪替
+│  ├─ ollama-models.ps1        ← 匯出／還原 11GB 模型（Windows）
+│  ├─ ollama-models.sh         ← 同上（macOS / Linux）
+│  ├─ make-offline-bundle.ps1  ← 產生離線安裝包（打包 + 壓縮 + 切割 + 校驗碼）
+│  └─ install-offline.ps1      ← 目標機器上從離線包安裝
 │
 ├─ dashboard/                  ← SPC 管制圖前端（Next.js 14 + TypeScript）
 │  ├─ app/
@@ -1133,8 +1476,8 @@ PACKAGE/
 4. 指令改用 Terminal：
 
    ```bash
-   git clone https://github.com/iflychen/PACKAGE.git
-   cd PACKAGE
+   git clone https://github.com/<你的帳號>/ipqc-spc-system.git
+   cd ipqc-spc-system
    nano .env            # 或 code .env
    docker compose up -d --build
    ```
@@ -1177,8 +1520,8 @@ PACKAGE/
 3. 其餘步驟相同：
 
    ```bash
-   git clone https://github.com/iflychen/PACKAGE.git
-   cd PACKAGE
+   git clone https://github.com/<你的帳號>/ipqc-spc-system.git
+   cd ipqc-spc-system
    nano .env
    docker compose up -d --build
    ```
@@ -1249,6 +1592,8 @@ PACKAGE/
 
 | 文件 | 內容 |
 | --- | --- |
+| [`OFFLINE-INSTALL.md`](OFFLINE-INSTALL.md) | ⭐ 離線安裝包：沒有外網的機器怎麼裝，含 GitHub 檔案大小限制與分割上傳 |
+| [`DEPLOY.md`](DEPLOY.md) | ⭐ 正式部署：CI 建置 + GHCR、版本發布與回退、log 輪替、image 鎖版、資料庫備份 |
 | [`dashboard/HANDOFF.md`](dashboard/HANDOFF.md) | ⭐ 最重要的技術文件：schema 語意、SPC 規則範圍、Phase I/II 流程、各種「看起來對其實錯」的陷阱 |
 | [`dashboard/README.md`](dashboard/README.md) | 前端架構與功能說明 |
 | [`dashboard/DOCKER.md`](dashboard/DOCKER.md) | Dashboard 單獨建置與執行 |

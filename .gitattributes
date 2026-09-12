@@ -1,0 +1,39 @@
+# =============================================================================
+#  換行字元規範
+#  ---------------------------------------------------------------------------
+#  Windows 版 Git 預設 core.autocrlf=true，會把 checkout 出來的檔案轉成 CRLF。
+#  init-realdb.sh 是在 Linux 容器內執行的，一旦變成 CRLF，shell 會去找
+#  "/bin/sh\r" 這個不存在的直譯器，database-init 直接掛掉。
+#
+#  這個檔把「在容器內執行」的檔案強制鎖成 LF，不管使用者的 Git 怎麼設定。
+# =============================================================================
+
+# 預設：文字檔在 repo 內一律存成 LF
+* text=auto eol=lf
+
+# --- 必須是 LF，否則容器內執行會失敗 ---------------------------------------
+*.sh            text eol=lf
+Dockerfile      text eol=lf
+*.Dockerfile    text eol=lf
+.dockerignore   text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.sql           text eol=lf
+*.py            text eol=lf
+*.ts            text eol=lf
+*.tsx           text eol=lf
+*.json          text eol=lf
+
+# --- Windows 專用批次檔要保持 CRLF -------------------------------------------
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+*.ps1           text eol=crlf
+
+# --- 二進位檔，不要做任何轉換 -------------------------------------------------
+*.dump          binary
+*.pdf           binary
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.webp          binary
+*.db            binary
