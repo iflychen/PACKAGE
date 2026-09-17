@@ -29,6 +29,7 @@ import type {
 const CHART_TYPES: ChartType[] = ["I-MR", "Xbar-R", "Xbar-S"];
 type ChartViewMode = "monitor" | "analysis";
 type MainView = "monitor" | "capability" | "history";
+type CapabilityStatusMetric = "cpk" | "cp" | "ppk" | "cpm" | "cpmk";
 
 interface ControlLimitVersion {
   product: string;
@@ -322,6 +323,8 @@ export default function Page() {
     abnormal: true,
     ai: false,
   });
+  const [capabilityStatusMetric, setCapabilityStatusMetric] =
+    useState<CapabilityStatusMetric>("cpk");
 
   // 設定
   const [minSamples, setMinSamplesState] = useState<number>(5);
@@ -384,6 +387,8 @@ export default function Page() {
   const [approvalMessage, setApprovalMessage] = useState<string | null>(null);
   const [chartRevision, setChartRevision] = useState(0);
   const chartRequestIdRef = useRef(0);
+  const reportRef = useRef<HTMLElement>(null);
+  const printRequestedRef = useRef(false);
   const [autoBatch, setAutoBatch] = useState<{
     running: boolean;
     processed: number;
@@ -1424,6 +1429,16 @@ export default function Page() {
     eventIntervals.find((it) => it.interval_id === selInterval) ?? null;
   const metrics = cap?.metrics ?? null;
   const isGood = metrics?.cpk != null && metrics.cpk >= cpkThreshold;
+  const capabilityStatusLabel: Record<CapabilityStatusMetric, string> = {
+    cpk: "Cpk",
+    cp: "Cp",
+    ppk: "Ppk",
+    cpm: "Cpm",
+    cpmk: "Cpmk",
+  };
+  const capabilityStatusValue = metrics?.[capabilityStatusMetric] ?? null;
+  const isCapabilityStatusGood =
+    capabilityStatusValue != null && capabilityStatusValue >= cpkThreshold;
   const titles = chartTitles(selChartType);
   // Recharts 在資料點數不變、只有 ReferenceLine 值改變時偶爾會保留舊圖層。
   // 將正式／trial 界線納入 key，界線版本改變就重建 chart instance。
@@ -1479,10 +1494,67 @@ export default function Page() {
     setReportOptions((current) => ({ ...current, [key]: !current[key] }));
   };
 
+  useEffect(() => {
+    if (!reportPreview || !printRequestedRef.current) return;
+
+    let cancelled = false;
+    const finishPrint = () => {
+      printRequestedRef.current = false;
+      setReportPreview(false);
+    };
+
+    const waitForReportCharts = async () => {
+      // ResponsiveContainer 掛在 display:none 的節點時寬高會是 0。
+      // 先讓預覽層完成排版，再確認 Recharts SVG 已取得實際尺寸後列印。
+      try {
+        await document.fonts?.ready;
+      } catch {
+        // 字型載入失敗不應阻止列印。
+      }
+
+      const expectedChartCount =
+        reportOptions.charts && visibleData ? (visibleData.mr ? 2 : 1) : 0;
+
+      for (let attempt = 0; attempt < 20 && !cancelled; attempt += 1) {
+        window.dispatchEvent(new Event("resize"));
+        await new Promise<void>((resolve) =>
+          window.requestAnimationFrame(() =>
+            window.requestAnimationFrame(() => resolve()),
+          ),
+        );
+
+        const charts = Array.from(
+          reportRef.current?.querySelectorAll<SVGSVGElement>(
+            ".recharts-wrapper svg",
+          ) ?? [],
+        );
+        const chartsReady =
+          charts.length >= expectedChartCount &&
+          charts.every((chart) => {
+            const rect = chart.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          });
+
+        if (chartsReady) break;
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 50));
+      }
+
+      if (!cancelled) window.print();
+    };
+
+    window.addEventListener("afterprint", finishPrint, { once: true });
+    void waitForReportCharts();
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener("afterprint", finishPrint);
+    };
+  }, [reportPreview, reportOptions.charts, visibleData]);
+
   const printReport = () => {
+    printRequestedRef.current = true;
     setReportOpen(false);
     setReportPreview(true);
-    window.setTimeout(() => window.print(), 80);
   };
 
   return (
@@ -1721,10 +1793,44 @@ export default function Page() {
           <strong>{visibleData?.points.length ?? selectedCombo?.sample_size ?? 0}</strong>
           <small>目前事件區間有效樣本</small>
         </article>
-        <article className={`status-card capability ${isGood ? "good" : ""}`}>
-          <span className="status-label">能力概況{hasActiveLimit ? "" : "（暫估）"}</span>
-          <strong>Cpk {fmt(metrics?.cpk, 2)}</strong>
-          <small>Cp {fmt(metrics?.cp, 2)} · Ppk {fmt(metrics?.ppk, 2)}</small>
+        <article
+          className={`status-card capability ${isCapabilityStatusGood ? "good" : ""}`}
+        >
+          <div className="status-card-head">
+            <span className="status-label">
+              能力概況{hasActiveLimit ? "" : "（暫估）"}
+            </span>
+            <span className="status-metric-picker">
+              <select
+                className="status-metric-select"
+                aria-label="能力概況指標"
+                value={capabilityStatusMetric}
+                onChange={(event) =>
+                  setCapabilityStatusMetric(
+                    event.target.value as CapabilityStatusMetric,
+                  )
+                }
+              >
+                <option value="cpk">Cpk</option>
+                <option value="cp">Cp</option>
+                <option value="ppk">Ppk</option>
+                <option value="cpm">Cpm</option>
+                <option value="cpmk">Cpmk</option>
+              </select>
+              <span className="status-metric-chevron" aria-hidden="true">
+                ▾
+              </span>
+            </span>
+          </div>
+          <strong>
+            {capabilityStatusLabel[capabilityStatusMetric]}{" "}
+            {fmt(capabilityStatusValue, 2)}
+          </strong>
+          <small>
+            {capabilityStatusValue == null
+              ? "無能力資料"
+              : `${isCapabilityStatusGood ? "達" : "低於"}門檻 ${cpkThreshold}`}
+          </small>
         </article>
       </section>
 
@@ -2443,12 +2549,33 @@ export default function Page() {
       )}
 
       {reportPreview && (
-        <section className="print-report">
+        <section className="print-report" ref={reportRef}>
           <header><div><h1>SPC 製程品質報表</h1><p>{selProduct} / {selProcess} / {selMachine} / {selFeature} / {selChartType}</p></div><div><b>{currentPhase}</b><p>產生時間 {new Date().toLocaleString("zh-TW")}</p></div></header>
           <div className="print-summary"><span>最新量測 <b>{latestPoint ? fmt(latestPoint.value) : "—"}</b></span><span>樣本 <b>{visibleData?.points.length ?? 0}</b></span><span>失控 <b>{stats.control}</b></span><span>超規 <b>{stats.spec}</b></span><span>Cpk <b>{fmt(metrics?.cpk, 2)}</b>{!hasActiveLimit && "（暫估）"}</span></div>
+          {reportOptions.abnormal && (
+            <div className="print-block print-abnormal">
+              <h2>異常判定與清單（共 {abnormalCount} 筆）</h2>
+              <p>
+                上圖統計：正常 {stats.normal} / 失控 {stats.control} / 超規 {stats.spec}
+              </p>
+              <div className="print-abnormal-grid">
+                <AbnormalSection
+                  title={`上圖 ${primaryComponent}`}
+                  chartLabel={primaryComponent}
+                  tone="primary"
+                  items={abnormalByChart.primary}
+                />
+                <AbnormalSection
+                  title={`下圖 ${secondaryComponent}`}
+                  chartLabel={secondaryComponent}
+                  tone="secondary"
+                  items={abnormalByChart.secondary}
+                />
+              </div>
+            </div>
+          )}
           {reportOptions.charts && visibleData && <div className="print-block"><h2>管制圖</h2><ControlChart data={visibleData} mode="monitor" height={225} />{visibleData.mr && <MovingRangeChart data={visibleData.mr} mode="monitor" height={190} />}</div>}
           {reportOptions.capability && <div className="print-block"><h2>製程能力{hasActiveLimit ? "" : "（Phase I 暫估）"}</h2><div className="print-metrics"><span>Cp {fmt(metrics?.cp, 2)}</span><span>Cpk {fmt(metrics?.cpk, 2)}</span><span>Ppk {fmt(metrics?.ppk, 2)}</span><span>平均 {fmt(metrics?.mean)}</span><span>σ {fmt(metrics?.sigma)}</span><span>USL {fmt(metrics?.usl)}</span><span>LSL {fmt(metrics?.lsl)}</span></div></div>}
-          {reportOptions.abnormal && <div className="print-block"><h2>異常判定</h2><p>正常 {stats.normal} / 失控 {stats.control} / 超規 {stats.spec}</p>{abnormalCount === 0 ? <p>目前無異常點。</p> : <ul>{[...abnormalByChart.primary, ...abnormalByChart.secondary].slice(0, 20).map((item, index) => <li key={`${item.x}-${index}`}>{item.x} · {fmt(item.value)} · {item.violatedRules.map(ruleLabel).join("、")}</li>)}</ul>}</div>}
           {reportOptions.ai && <div className="print-block"><h2>AI 品質摘要</h2><pre>{aiSummary ?? "尚未產生 AI 摘要。"}</pre></div>}
           <button className="print-close no-print" onClick={() => setReportPreview(false)}>關閉報表預覽</button>
         </section>
