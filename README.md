@@ -291,7 +291,7 @@ git --version
 mkdir C:\projects
 cd C:\projects
 git clone https://github.com/iflychen/PACKAGE.git
-cd ipqc-spc-system
+cd PACKAGE
 ```
 
 確認檔案都在：
