@@ -11,7 +11,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 
-import { getIntervalSampleStats, listToolIntervals } from "@/lib/db";
+import { getIntervalSampleStats, listEventIntervals } from "@/lib/db";
 import { getMinSamples } from "@/lib/config";
 
 export const dynamic = "force-dynamic";
@@ -44,7 +44,7 @@ export async function GET(req: NextRequest) {
 
   let intervals;
   try {
-    intervals = await listToolIntervals(machine);
+    intervals = await listEventIntervals(machine);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
