@@ -290,7 +290,7 @@ git --version
 ```powershell
 mkdir C:\projects
 cd C:\projects
-git clone https://github.com/<你的帳號>/ipqc-spc-system.git
+git clone https://github.com/iflychen/PACKAGE.git
 cd ipqc-spc-system
 ```
 
