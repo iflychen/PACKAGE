@@ -13,21 +13,26 @@ class LlmError(RuntimeError):
     pass
 
 
-async def generate_with_ollama(prompt: str) -> str:
+async def generate_with_ollama(prompt: str, system: str | None = None) -> str:
+    body: dict = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 700,
+        },
+    }
+    if system:
+        # Ollama 的 system 欄位比寫在 prompt 裡更能約束輸出語言與格式。
+        body["system"] = system
+
     try:
         async with httpx.AsyncClient(timeout=240.0) as client:
             response = await client.post(
                 f"{OLLAMA_BASE_URL.rstrip('/')}/api/generate",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                    "think": False,
-                    "options": {
-                        "temperature": 0.2,
-                        "num_predict": 700,
-                    },
-                },
+                json=body,
             )
     except httpx.HTTPError as exc:
         raise LlmError(f"ollama_request_failed: {exc}") from exc

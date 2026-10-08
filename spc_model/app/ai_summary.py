@@ -168,8 +168,15 @@ def build_summary_context(
     return "\n".join(context_lines)
 
 
+SUMMARY_SYSTEM_PROMPT = (
+    "你是台灣製造業工廠的品管工程師。"
+    "一律使用繁體中文（台灣用語）回答，絕對不要使用簡體字。"
+    "輸出純文字，不要使用 Markdown 符號（例如 **、#、`）。"
+)
+
+
 def build_summary_prompt(summary_context: str) -> str:
-    return f"""內容根據以下 SPC 管制圖資料產生摘要。
+    return f"""請使用繁體中文（台灣用語），根據以下 SPC 管制圖資料產生摘要。
 
 1. 整體製程狀態
 2. 是否有超出規格或管制界限
@@ -184,6 +191,9 @@ def build_summary_prompt(summary_context: str) -> str:
 - Cpk 低於門檻時要明確指出；Cp 高但 Cpk 低時，說明製程可能偏心
 - Cpm / Cpmk 需連同目標值偏移解讀，Ppk 用於描述整體長期表現
 - 不可只憑能力指標宣稱製程穩定，穩定性仍以管制圖訊號判斷
+- Cpk 與 Cp 相差不到 10% 時，視為製程中心接近規格中心，不要說偏心；Cpm 與 Cpmk 同理
+- 數值保留到小數點後 2 位即可
+- 全文使用繁體中文，不可出現簡體字；不要使用 Markdown 粗體或標題符號
 
 資料如下：
 {summary_context}
@@ -209,5 +219,5 @@ async def generate_ai_summary(request: AiSummaryRequest) -> AiSummaryResponse:
         request.capability_data,
     )
     prompt = build_summary_prompt(summary_context)
-    summary = await generate_with_ollama(prompt)
+    summary = await generate_with_ollama(prompt, system=SUMMARY_SYSTEM_PROMPT)
     return AiSummaryResponse(summary=summary, summary_context=summary_context)
