@@ -6,6 +6,8 @@ const SPC_API_BASE = process.env.SPC_API_BASE ?? "http://127.0.0.1:8000";
 
 interface AiSummaryBody {
   chartData?: unknown;
+  /** ② 製程能力的資料；Python 端以 capability_data 接收，可省略。 */
+  capabilityData?: unknown;
 }
 
 export async function POST(req: NextRequest) {
@@ -30,7 +32,13 @@ export async function POST(req: NextRequest) {
     const res = await fetch(`${SPC_API_BASE}/spc/ai-summary`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chart_data: body.chartData }),
+      body: JSON.stringify({
+        chart_data: body.chartData,
+        capability_data:
+          body.capabilityData && typeof body.capabilityData === "object"
+            ? body.capabilityData
+            : null,
+      }),
       cache: "no-store",
     });
 

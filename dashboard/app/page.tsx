@@ -1291,6 +1291,52 @@ export default function Page() {
     }
   };
 
+  /**
+   * AI 摘要需要的製程能力資料。Python 端 /spc/ai-summary 以 capability_data
+   * 讀取 metrics / table_summary / daily；沒帶的話模型只會看到
+   * 「capability: not provided」，就會回答讀不到 Cp、Cpk。
+   */
+  const buildCapabilityData = () => {
+    if (!cap) return null;
+    // 能力資料是非同步載入的；切換尺寸途中 metrics 可能還是上一個尺寸的。
+    const metrics =
+      cap.metrics && cap.metrics.feature_name === selFeature ? cap.metrics : null;
+    const threshold = cap.cpk_threshold ?? cpkThreshold;
+    const rows: CapabilityTableRow[] = cap.table ?? [];
+    const belowThreshold = rows.filter(
+      (row) => row.cpk != null && row.cpk < threshold,
+    );
+    return {
+      selection: {
+        product: selProduct,
+        process: selProcess,
+        machine: selMachine,
+        feature_name: selFeature,
+        chart_type: selChartType,
+      },
+      metrics,
+      cpk_threshold: threshold,
+      meets_cpk_threshold:
+        metrics?.cpk != null ? metrics.cpk >= threshold : null,
+      table_summary: {
+        feature_count: rows.length,
+        below_threshold_count: belowThreshold.length,
+        unavailable_count: rows.filter((row) => row.cpk == null).length,
+        below_threshold_features: belowThreshold.map((row) => ({
+          feature_name: row.feature_name,
+          cpk: row.cpk,
+          sample_size: row.sample_size,
+        })),
+      },
+      daily: cap.daily
+        ? {
+            day_count: cap.daily.day_count,
+            last_measured_at: cap.daily.last_measured_at,
+          }
+        : null,
+    };
+  };
+
   const generateAiSummary = async () => {
     const summaryData = trialData?.chart ?? data;
     if (!summaryData) return;
@@ -1301,7 +1347,10 @@ export default function Page() {
       const response = await fetch("/api/ai-summary", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chartData: summaryData }),
+        body: JSON.stringify({
+          chartData: summaryData,
+          capabilityData: buildCapabilityData(),
+        }),
       });
       const payload = await response.json();
       if (!response.ok) {
