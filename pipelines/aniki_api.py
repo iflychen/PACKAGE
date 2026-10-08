@@ -313,6 +313,22 @@ def read_result_summary() -> dict[str, Any]:
     }
 
 
+def extract_neon_error(stdout: str) -> str:
+    """從 Aniki.py 輸出取出資料庫寫入失敗的原因。"""
+    lines = stdout.splitlines()
+
+    for index, line in enumerate(lines):
+        if "Neon 寫入失敗" in line:
+            detail = [
+                text.strip()
+                for text in lines[index + 1:index + 3]
+                if text.strip()
+            ]
+            return "：".join(detail) or "資料庫寫入失敗"
+
+    return "Aniki 未回報資料庫寫入結果"
+
+
 def run_aniki_process(
     command: list[str],
     process_environment: dict[str, str],
@@ -703,6 +719,11 @@ def _process_single_report(
             "neon_success": (
                 neon_success
             ),
+            "neon_error": (
+                None
+                if neon_success
+                else extract_neon_error(stdout)
+            ),
             "return_code": (
                 return_code
             ),
@@ -723,18 +744,26 @@ def _process_single_report(
                 content=response,
             )
 
-        RECENT_SUCCESS_RESULTS[
-            content_key
-        ] = (
-            time.monotonic(),
-            dict(response),
-        )
+        if neon_success:
+            # 只快取真正寫入資料庫的結果；寫入失敗時重送同一檔案要重新處理。
+            RECENT_SUCCESS_RESULTS[
+                content_key
+            ] = (
+                time.monotonic(),
+                dict(response),
+            )
 
-        print(
-            "[API] 處理完成，"
-            "資料已成功寫入 Neon",
-            flush=True,
-        )
+            print(
+                "[API] 處理完成，"
+                "資料已成功寫入 Neon",
+                flush=True,
+            )
+        else:
+            print(
+                "[API] 辨識完成，但資料未寫入 Neon："
+                f"{response['neon_error']}",
+                flush=True,
+            )
 
         print(
             f"[API] 測量項目數量："

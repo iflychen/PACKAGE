@@ -593,6 +593,34 @@ class Pipe:
                 row_count = payload.get("row_count", 0)
                 page_numbers = payload.get("page_numbers") or []
 
+                if payload.get("neon_success") is False:
+                    reason = payload.get("neon_error") or "資料庫寫入失敗"
+                    results.append(
+                        "\n".join(
+                            [
+                                f"❌ **{filename}** 辨識完成，但未寫入資料庫",
+                                f"- 原因：{reason}",
+                                f"- 品號：{metadata.get('品號') or '未讀到'}",
+                                f"- 製程：{metadata.get('製程') or '未讀到'}",
+                                f"- 機台：{metadata.get('機台') or '未讀到'}",
+                                f"- 流水號：{metadata.get('流水號') or '未讀到'}",
+                                f"- 處理頁面：{page_numbers}",
+                                f"- 測量項目：{row_count} 筆",
+                            ]
+                        )
+                    )
+                    if __event_emitter__:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"{filename} 未寫入資料庫",
+                                    "done": True,
+                                },
+                            }
+                        )
+                    continue
+
                 completion_text = (
                     "已完成辨識並取代資料庫中的舊資料"
                     if payload.get("replaced_existing")
@@ -606,6 +634,7 @@ class Pipe:
                             f"✅ **{filename}** {completion_text}",
                             f"- 品號：{metadata.get('品號') or '未讀到'}",
                             f"- 製程：{metadata.get('製程') or '未讀到'}",
+                            f"- 機台：{metadata.get('機台') or '未讀到'}",
                             f"- 流水號：{metadata.get('流水號') or '未讀到'}",
                             f"- 處理頁面：{page_numbers}",
                             f"- 測量項目：{row_count} 筆",

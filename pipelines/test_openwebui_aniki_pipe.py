@@ -154,6 +154,52 @@ class PipeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.count("已完成辨識"), 1)
             post.assert_called_once()
 
+    async def test_database_write_failure_is_not_reported_as_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upload_dir = Path(directory)
+            uploaded = upload_dir / "stored-report.pdf"
+            uploaded.write_bytes(b"pdf")
+            item = {
+                "file": {
+                    "id": "file-id",
+                    "filename": "report.pdf",
+                    "path": str(uploaded),
+                }
+            }
+            response = Mock()
+            response.ok = True
+            response.status_code = 200
+            response.json.return_value = {
+                "success": True,
+                "metadata": {"品號": "P-1", "製程": "銑1"},
+                "row_count": 0,
+                "page_numbers": [1],
+                "neon_success": False,
+                "neon_error": "ValueError：metadata 裡沒有「機台」",
+            }
+
+            pipe = Pipe()
+            pipe.valves.API_KEY = "test-key"
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"OPENWEBUI_UPLOAD_DIR": str(upload_dir)},
+                ),
+                patch(
+                    "openwebui_aniki_pipe.requests.post",
+                    return_value=response,
+                ),
+            ):
+                result = await pipe.pipe(
+                    {"messages": [{"role": "user", "content": ""}]},
+                    __files__=[item],
+                )
+
+            self.assertIn("未寫入資料庫", result)
+            self.assertIn("metadata 裡沒有「機台」", result)
+            self.assertNotIn("已完成辨識並寫入資料庫", result)
+
     async def test_existing_file_asks_then_text_confirmation_replaces_it(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_dir = Path(directory)
