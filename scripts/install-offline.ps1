@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     從離線安裝包還原整套系統。在**目標機器**上執行，不需要外網。
 
@@ -36,6 +36,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# ---------------------------------------------------------------------------
+#  $ErrorActionPreference = 'Stop' 會把原生指令寫到 stderr 的訊息當成中止錯誤。
+#  探測類的呼叫（某個 image/volume 在不在）本來就會輸出 stderr，要隔離開來。
+# ---------------------------------------------------------------------------
+function Test-NativeOk {
+    param([Parameter(Mandatory)][string]$FilePath,
+          [string[]]$ArgumentList = @())
+
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $FilePath @ArgumentList 2>&1 | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $old
+    }
+}
+
 function Join-Parts {
     param([string]$Dir, [string]$BaseName)
 
@@ -68,8 +86,9 @@ Write-Host "=== 離線安裝 ===" -ForegroundColor Green
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     throw "找不到 docker 指令。請先安裝並啟動 Docker Desktop。"
 }
-docker info 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Docker 沒有在執行，請先啟動 Docker Desktop 並等待狀態轉綠。" }
+if (-not (Test-NativeOk docker @('info'))) {
+    throw "Docker 沒有在執行，請先啟動 Docker Desktop 並等待狀態轉綠。"
+}
 
 if (-not (Test-Path (Join-Path $RepoDir 'docker-compose.yml'))) {
     throw "在 $RepoDir 找不到 docker-compose.yml。用 -RepoDir 指定專案原始碼的位置。"
@@ -105,17 +124,23 @@ if ((Test-Path $sumFile) -and -not $SkipVerify) {
 
 # --- 2. 合併並載入 image ---------------------------------------------------
 Write-Host "`n[2/5] 合併並載入 image..." -ForegroundColor Yellow
-$imagesGz = Join-Parts -Dir $BundleDir -BaseName 'images.tar.gz'
-if (-not $imagesGz) { throw "找不到 images.tar.gz（或它的分割檔）。" }
+
+# 打包時有沒有加 -Compress 決定是 images.tar 還是 images.tar.gz，兩種都接受。
+$imagesFile = $null
+foreach ($base in @('images.tar.gz', 'images.tar')) {
+    $imagesFile = Join-Parts -Dir $BundleDir -BaseName $base
+    if ($imagesFile) { $imagesBase = $base; break }
+}
+if (-not $imagesFile) { throw "找不到 images.tar 或 images.tar.gz（或它們的分割檔）。" }
 
 Write-Host "docker load（幾 GB，需要數分鐘）..." -ForegroundColor Cyan
-# docker load 認得 gzip，不用先解壓縮
-docker load -i $imagesGz
+# docker load 自己認得 gzip，不用先解壓縮
+docker load -i $imagesFile
 if ($LASTEXITCODE -ne 0) { throw "docker load 失敗。" }
 
 # 合併出來的大檔佔空間，載入成功就刪掉（分割檔保留）
-if (Get-ChildItem $BundleDir -Filter 'images.tar.gz.part*') {
-    Remove-Item $imagesGz -Force
+if (Get-ChildItem $BundleDir -Filter "$imagesBase.part*") {
+    Remove-Item $imagesFile -Force
 }
 
 # --- 3. 還原模型（如果有）--------------------------------------------------

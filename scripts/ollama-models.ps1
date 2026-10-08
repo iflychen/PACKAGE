@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     匯出／還原 Ollama 模型，省下重新下載 11 GB 的時間。
 
@@ -39,12 +39,29 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# ---------------------------------------------------------------------------
+#  $ErrorActionPreference = 'Stop' 會把原生指令寫到 stderr 的訊息當成中止錯誤。
+#  探測類的呼叫（某個 image/volume 在不在）本來就會輸出 stderr，要隔離開來。
+# ---------------------------------------------------------------------------
+function Test-NativeOk {
+    param([Parameter(Mandatory)][string]$FilePath,
+          [string[]]$ArgumentList = @())
+
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $FilePath @ArgumentList 2>&1 | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $old
+    }
+}
+
 function Assert-Docker {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
         throw "找不到 docker 指令，請先啟動 Docker Desktop。"
     }
-    docker info 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+    if (-not (Test-NativeOk docker @('info'))) {
         throw "Docker 沒有在執行，請先啟動 Docker Desktop 並等待狀態轉綠。"
     }
 }
