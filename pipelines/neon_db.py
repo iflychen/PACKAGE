@@ -273,6 +273,7 @@ def validate_required_columns(
             "流水號",
             "量測時間",
             "量測人員",
+            "來源檔名",
         },
         TABLE_BALL_SIZE: {
             "品號",
@@ -475,13 +476,16 @@ def upsert_job(
     serial_number: str,
     measurement_time: Optional[datetime],
     operator: Optional[str],
+    source_file_name: str,
 ) -> None:
+    # 來源檔名 → 來源檔案(檔名)。重新匯入同一個工件時更新成最新那份檔案。
     update_query = sql.SQL(
         """
         UPDATE {}
         SET
             "量測時間" = %s,
-            "量測人員" = %s
+            "量測人員" = %s,
+            "來源檔名" = %s
         WHERE "品號" = %s
           AND "製程" = %s
           AND "機台" = %s
@@ -494,6 +498,7 @@ def upsert_job(
         (
             measurement_time,
             operator,
+            source_file_name,
             part_number,
             process_name,
             machine,
@@ -510,9 +515,10 @@ def upsert_job(
                 "機台",
                 "流水號",
                 "量測時間",
-                "量測人員"
+                "量測人員",
+                "來源檔名"
             )
-            VALUES (%s, %s, %s, %s, %s, %s);
+            VALUES (%s, %s, %s, %s, %s, %s, %s);
             """
         ).format(table_identifier(TABLE_JOB))
 
@@ -525,6 +531,7 @@ def upsert_job(
                 serial_number,
                 measurement_time,
                 operator,
+                source_file_name,
             ),
         )
 
@@ -694,6 +701,12 @@ def save_aniki_result(
     if not serial_number:
         raise ValueError("metadata 裡沒有「流水號」")
 
+    # upsert_source_file() 缺檔名會丟例外，這裡先取出來給 工件 用。
+    source_file_name = normalize_text(file_info.get("檔名"))
+
+    if not source_file_name:
+        raise ValueError("file_info 裡沒有「檔名」")
+
     measurement_time = parse_measurement_time(metadata)
     rows = list(iter_rows(final_output))
 
@@ -739,6 +752,7 @@ def save_aniki_result(
                 serial_number=serial_number,
                 measurement_time=measurement_time,
                 operator=operator,
+                source_file_name=source_file_name,
             )
             counts["工件"] = 1
 

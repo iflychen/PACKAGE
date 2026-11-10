@@ -492,7 +492,8 @@ docker compose logs -f
 ```text
 REALDB is empty; restoring /backup/REALDB_backup.dump
 REALDB restore completed
-applying migration 20260904_phase_i_trial_review.sql
+applying migration 20261111_trial_review.sql
+applying migration 20261112_part_source_file.sql
 migrations completed
 ```
 
@@ -539,9 +540,10 @@ docker compose exec ollama ollama list
 docker compose exec postgres psql -U postgres -d REALDB -c "\dt"
 ```
 
-要看到 **10 張**資料表：dump 還原的 9 張
+要看到 **11 張**資料表：dump 還原的 9 張
 `來源檔案`、`品號`、`製程`、`機台`、`工件`、`球標尺寸`、`測量值`、`事件紀錄`、`管制圖`，
-加上 migration 建立的 `phase_i_trial_review`。
+加上 migration 建立的 `試算覆核`、`試算覆核歷程`。
+（從舊版升級的環境還會多一張 `phase_i_trial_review_legacy`，是改版前的舊覆核表，確認資料無誤後可以刪除。）
 
 再確認兩個 view：
 
@@ -773,23 +775,24 @@ http://localhost:8000/review/<token>
 ### 12.1 Schema
 
 `REALDB_backup.dump` 是用 **PostgreSQL 18.3** 匯出的 custom format dump，
-裡面有 **9 張表與 2 個 view**；第 10 張表 `phase_i_trial_review` 不在 dump 裡，
+裡面有 **9 張表與 2 個 view**；`試算覆核`、`試算覆核歷程` 不在 dump 裡，
 是由 `dashboard/db/migrations/` 的 migration 建立的。
 
 **資料表**
 
 | 表 | 主鍵 | 說明 |
 | --- | --- | --- |
-| `來源檔案` | — | 已辨識過的檢查表檔案紀錄（用來擋同名檔案） |
+| `來源檔案` | — | 已辨識過的檢查表檔案紀錄（用來擋同名檔案）；一份檔案對應一筆 `工件` |
 | `品號` | — | 產品品號主檔 |
 | `製程` | — | 製程主檔 |
 | `機台` | — | 機台主檔 |
-| `工件` | `(機台, 流水號)` | 一件工件一列 |
+| `工件` | `(機台, 流水號)` | 一件工件一列；`來源檔名` → `來源檔案`（由 migration 加上，非 pipeline 匯入的工件為 NULL） |
 | `球標尺寸` | — | 尺寸規格（名義值、上下公差） |
 | `測量值` | `(機台, 流水號, 球標尺寸名)` | 實際量測值，含 `是否異常` 旗標 |
 | `事件紀錄` | `id` | 換刀／保養／參數調整等事件（`事件類型` 是自由文字） |
 | `管制圖` | `(品號, 製程, 機台, 球標尺寸名, 管制圖類型, 管制開始時間)` | 管制界線版本與製程能力值 |
-| `phase_i_trial_review` | 複合鍵 | Phase I 疑似異常點的人工覆核紀錄（由 migration 建立） |
+| `試算覆核` | `id`（唯一鍵：品號, 製程, 機台, 球標尺寸名, 管制圖類型, 事件紀錄id, 流水號） | Phase I 疑似異常點的覆核目前狀態（由 migration 建立） |
+| `試算覆核歷程` | `id` | 每次覆核一筆、只新增不修改的稽核軌跡（由 migration 建立） |
 
 **View**
 
@@ -1161,10 +1164,16 @@ docker compose logs -f database-init
 ```text
 REALDB is empty; restoring /backup/REALDB_backup.dump
 REALDB restore completed
-applying migration 20260904_phase_i_trial_review.sql
+applying migration 20261111_trial_review.sql
+CREATE TABLE
 CREATE TABLE
 CREATE INDEX
 DO
+applying migration 20261112_part_source_file.sql
+ALTER TABLE
+DO
+CREATE INDEX
+UPDATE 0
 migrations completed
 ```
 
