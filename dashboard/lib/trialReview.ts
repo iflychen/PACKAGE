@@ -32,7 +32,7 @@ export interface TrialReviewKey {
   machine: string;
   feature_name: string;
   chart_type: ChartType;
-  /** 事件區間 id；null 代表不分區間(DB 端以 -1 當哨兵值存放)。 */
+  /** 事件區間 id；null 代表不分區間(DB 端 事件紀錄id 存 NULL)。 */
   event_interval_id: number | null;
 }
 

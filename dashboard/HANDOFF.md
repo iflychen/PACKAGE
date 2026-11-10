@@ -367,21 +367,35 @@ makes it Phase II monitoring rather than a moving average.
 Capability values (`cp` … `ppk`) still use *all* samples in the interval, so the
 dashboard and the DB agree on current process performance.
 
-## Phase I Trial Review (`phase_i_trial_review`)
+## Phase I Trial Review (`試算覆核` / `試算覆核歷程`)
 
 Every suspected abnormal point from a Phase I trial gets a durable row, so that
 "who excluded which point and why" survives a page reload and a shift change.
+
+| Table | Holds |
+| --- | --- |
+| `試算覆核` | one row per point: latest trial facts + current review state |
+| `試算覆核歷程` | one row per review action, append-only |
+
+Column names are Chinese like every other table, so foreign keys and joins
+line up by name. The API and `page.tsx` still use the English keys
+(`point_id`, `review_status`, …): `lib/db.ts` maps them with `AS` aliases, and
+`point_id` is the integer `流水號` rendered as a string.
 
 ### Flow
 
 | Step | Code | Effect |
 | --- | --- | --- |
 | Trial | `POST /api/control-limit/trial` → `syncTrialReviews()` | upserts one row per point as `pending` |
-| Review | `POST /api/control-limit/review` → `saveTrialReview()` | flips one row to `reviewed` + disposition + reason |
+| Review | `POST /api/control-limit/review` → `saveTrialReview()` | flips one row to `reviewed` + disposition + reason, and appends a `試算覆核歷程` row |
 
 `syncTrialReviews()` returns the full list, and the trial response carries it as
 `reviews`. The dashboard renders its suspected-point list from `reviews` when
 present, falling back to `suspected_points` when the table is unavailable.
+
+`saveTrialReview()` does the update and the history insert in one statement
+(a data-modifying CTE). `getSql()` may hand each call a different pooled
+connection, so two separate calls could not share a transaction.
 
 ### Rules that live in the database, not the UI
 
@@ -390,25 +404,42 @@ requires a reason code; reason `other` requires a non-blank note. Client-side
 validation in `page.tsx` exists only for instant feedback — the database is what
 actually guarantees an excluded baseline point always has a documented reason.
 
-### One row per `point_id`, not per chart
+Foreign keys tie each row to real master data:
+
+| Columns | References |
+| --- | --- |
+| `(品號, 製程, 球標尺寸名)` | `球標尺寸` |
+| `(機台, 流水號)` | `工件` |
+| `事件紀錄id` | `事件紀錄.id` |
+
+All are `ON UPDATE CASCADE ON DELETE RESTRICT`, matching the rest of the
+schema: renaming a machine or feature carries over, and master data that has
+review history cannot be deleted out from under the audit trail.
+
+### One row per point, not per chart
 
 A point can trip both the top chart (I / Xbar) and the bottom chart (MR / R / S).
-The primary key is `point_id`, so `app/api/control-limit/trial/route.ts` merges
-those into a single `TrialSignal` and records both origins in `signal_sources`.
-Writing two rows would violate the primary key.
+The unique key ends in `流水號`, so `app/api/control-limit/trial/route.ts` merges
+those into a single `TrialSignal` and records both origins in `訊號來源`.
+Writing two rows would violate the unique key.
 
-`actual_value` comes from whichever chart is listed first — top chart wins when
+For I-MR the point is the workpiece's `流水號`; for Xbar-R / Xbar-S it is the
+`流水號` of the subgroup's first sample. Either way it exists in `工件`. A
+`point_id` that is not an integer means the upstream fell back to some other
+id; `syncTrialReviews()` throws on it rather than writing an unlinked row.
+
+`實際值` comes from whichever chart is listed first — top chart wins when
 the point trips both, so it is the measured value. A point that only trips the
 bottom chart stores the MR / R / S value, which is what flagged it.
 
 ### Upsert never touches human decisions
 
 `syncTrialReviews()` updates only the facts the trial recomputed
-(`actual_value`, `violated_rules`, `signal_sources`, `trial_violation`). It must
-never reset `review_status`, `baseline_disposition`, `exclusion_*` or
-`reviewed_*` — recalculating would otherwise wipe the audit trail.
+(`實際值`, `違反規則`, `訊號來源`, `試算是否異常`). It must never reset
+`覆核狀態`, `基準處置`, `排除*` or `覆核*` — recalculating would otherwise wipe
+the audit trail.
 
-Points that are no longer flagged keep their row with `trial_violation = false`.
+Points that are no longer flagged keep their row with `試算是否異常 = false`.
 "Someone excluded this point for this reason" stays true even after the point
 stops being an outlier.
 
@@ -418,18 +449,34 @@ A feature can be approved into Phase II with rows still `pending`. This is
 deliberate: gating would conflict with `auto_create_control_limit`, where a
 batch approves features with nobody present to review anything.
 
-### `event_interval_key` uses `-1`, not NULL
+### "No interval" is `NULL`, and the unique key is `NULLS NOT DISTINCT`
 
-The column is part of the primary key, and primary key columns cannot be NULL,
-so "not scoped to an interval" is stored as `-1`. Do not "fix" it to nullable.
+`事件紀錄id` is NULL when the trial is not scoped to an event interval. The
+table has a surrogate `id` primary key, and the natural key is a
+`UNIQUE NULLS NOT DISTINCT` constraint (PostgreSQL 15+), so two NULL-interval
+rows for the same point still conflict and `ON CONFLICT` upserts work.
 
-### The table is created by a migration, not by the dump
+Every lookup must compare with `"事件紀錄id" IS NOT DISTINCT FROM $n::int` —
+plain `=` never matches NULL and would silently return nothing.
 
-`REALDB_backup.dump` predates this table. `db/migrations/*.sql` is applied by
+(The previous `phase_i_trial_review` stored `-1` here because the column was
+part of the primary key. That sentinel is gone; do not bring it back — `-1`
+would fail the foreign key to `事件紀錄`.)
+
+### The tables are created by a migration, not by the dump
+
+`REALDB_backup.dump` predates these tables. `db/migrations/*.sql` is applied by
 `database-init` on every start (see the repo root `init-realdb.sh`), so every
 migration script must be idempotent — `CREATE TABLE IF NOT EXISTS`,
 `CREATE INDEX IF NOT EXISTS`, and `DO $$ ... $$` guards for anything else. There
 is no version-tracking table.
+
+`20261111_trial_review.sql` also migrates an existing `phase_i_trial_review`
+(old English-column table) into `試算覆核`, seeds one history row per already
+reviewed point, and renames the old table to `phase_i_trial_review_legacy`.
+The old `20260904_phase_i_trial_review.sql` was deleted on purpose: it re-ran
+`CREATE TABLE IF NOT EXISTS` every start and would recreate the old table right
+after it was renamed away.
 
 If the migration has not been applied, `syncTrialReviews()` throws, the trial
 route catches it and returns `review_error`, and the dashboard degrades to plain

@@ -14,6 +14,9 @@
 //    管制圖    PK(品號, 製程, 機台, 球標尺寸名, 管制圖類型, 管制開始時間)
 //              + 管制結束時間, 六條界線, 管制是否啟用, cp/cpk/cpm/cpmk/ppk
 //    來源檔案  PK(檔名) — 本前端未使用
+//    試算覆核  PK(id) + UNIQUE NULLS NOT DISTINCT(品號, 製程, 機台, 球標尺寸名,
+//              管制圖類型, 事件紀錄id, 流水號) — db/migrations 建立,見檔尾
+//    試算覆核歷程 PK(id) + 覆核id → 試算覆核,每次覆核一筆、只新增
 //
 //  VIEW
 //    事件使用區間 (事件紀錄id, 機台, 事件類型, 起始流水號,
@@ -855,14 +858,19 @@ export async function updateCapabilityValues(
 }
 
 // ============================================================================
-//  Phase I 試算疑似異常點的覆核紀錄 (phase_i_trial_review)
+//  Phase I 試算疑似異常點的覆核紀錄 (試算覆核 / 試算覆核歷程)
 //  ---------------------------------------------------------------------------
 //  流程:
 //    1. 試算  → syncTrialReviews() 以 pending 寫入 / 更新本次的疑似異常點
-//    2. 覆核  → saveTrialReview() 把單一點改成 reviewed + 處置 + 原因
+//    2. 覆核  → saveTrialReview() 把單一點改成 reviewed + 處置 + 原因,
+//               同時在 試算覆核歷程 新增一筆(只新增不修改)
 //
-//  主鍵不含事件類型,因為區間 id 本身已經隱含了事件類型(同一個 id 只屬於
-//  一種事件類型)。不分區間時以 -1 當哨兵值,因為主鍵欄位不可為 NULL。
+//  唯一鍵不含事件類型,因為區間 id 本身已經隱含了事件類型(同一個 id 只屬於
+//  一種事件類型)。不分區間時 事件紀錄id 為 NULL,唯一鍵是 NULLS NOT DISTINCT,
+//  所以比對一律用 IS NOT DISTINCT FROM,不能用 =。
+//
+//  對外(API / 前端)仍沿用英文 key 與字串型別的 point_id,中文欄位只在這裡
+//  用 AS 轉換,改表結構時前端不用跟著動。
 // ============================================================================
 
 interface TrialReviewRow {
@@ -895,36 +903,47 @@ function toTrialReviewRecord(row: TrialReviewRow): TrialReviewRecord {
   };
 }
 
+/**
+ * point_id → 流水號。管制圖的點 id 是工件流水號(Xbar 為子組首筆的流水號),
+ * 不是整數代表上游拿不到流水號、退回用了別的 id,這種點對不到工件,
+ * 不能寫進有外鍵的覆核表。
+ */
+function toSerialNo(pointId: string): number | null {
+  const trimmed = pointId.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const serialNo = Number(trimmed);
+  return Number.isSafeInteger(serialNo) && serialNo <= 2147483647
+    ? serialNo
+    : null;
+}
+
 /** 列出某組合目前所有覆核紀錄。仍被判異常的排前面。 */
 export async function listTrialReviews(
   key: TrialReviewKey,
 ): Promise<TrialReviewRecord[]> {
   const sql = getSql();
-  const intervalKey = key.event_interval_id ?? -1;
 
   const rows = (await sql`
     SELECT
-      point_id,
-      actual_value::float8 AS actual_value,
-      trial_violation,
-      violated_rules,
-      signal_sources,
-      review_status,
-      baseline_disposition,
-      exclusion_reason_code,
-      exclusion_note,
-      reviewed_by,
-      reviewed_at::text AS reviewed_at
-    FROM phase_i_trial_review
-    WHERE product = ${key.product}
-      AND process = ${key.process}
-      AND machine = ${key.machine}
-      AND feature_name = ${key.feature_name}
-      AND chart_type = ${key.chart_type}
-      AND event_interval_key = ${intervalKey}
-    -- point_id 是 varchar,直接排序 "10" 會跑到 "9" 前面。
-    -- 先比長度再比字典序,對純數字的流水號就等同數值排序。
-    ORDER BY trial_violation DESC, length(point_id), point_id
+      "流水號"::text          AS point_id,
+      "實際值"::float8        AS actual_value,
+      "試算是否異常"          AS trial_violation,
+      "違反規則"              AS violated_rules,
+      "訊號來源"              AS signal_sources,
+      "覆核狀態"              AS review_status,
+      "基準處置"              AS baseline_disposition,
+      "排除原因"              AS exclusion_reason_code,
+      "排除說明"              AS exclusion_note,
+      "覆核人員"              AS reviewed_by,
+      "覆核時間"::text        AS reviewed_at
+    FROM "試算覆核"
+    WHERE "品號" = ${key.product}
+      AND "製程" = ${key.process}
+      AND "機台" = ${key.machine}
+      AND "球標尺寸名" = ${key.feature_name}
+      AND "管制圖類型" = ${key.chart_type}
+      AND "事件紀錄id" IS NOT DISTINCT FROM ${key.event_interval_id}::int
+    ORDER BY "試算是否異常" DESC, "流水號"
   `) as unknown as TrialReviewRow[];
 
   return rows.map(toTrialReviewRecord);
@@ -934,14 +953,13 @@ export async function listTrialReviews(
  * 把本次試算的疑似異常點同步進覆核表,回傳同步後的完整清單。
  *
  * 呼叫端要先依 point_id 合併 —— 同一個點可能同時在上圖與下圖觸發,
- * 但主鍵是 point_id,兩張圖的來源要收進 sources 陣列而不是寫成兩列。
+ * 但唯一鍵含 流水號,兩張圖的來源要收進 sources 陣列而不是寫成兩列。
  *
- * ⚠️ upsert 只更新「這次算出來的事實」(actual_value / violated_rules /
- *    signal_sources / trial_violation),絕對不碰 review_status、
- *    baseline_disposition、exclusion_*、reviewed_* —— 那些是人工覆核結果,
- *    每次重算都被洗掉的話稽核軌跡就失去意義了。
+ * ⚠️ upsert 只更新「這次算出來的事實」(實際值 / 違反規則 / 訊號來源 /
+ *    試算是否異常),絕對不碰 覆核狀態、基準處置、排除*、覆核* ——
+ *    那些是人工覆核結果,每次重算都被洗掉的話稽核軌跡就失去意義了。
  *
- * 這次不再異常的舊點保留該列,只把 trial_violation 標成 false,理由同上:
+ * 這次不再異常的舊點保留該列,只把 試算是否異常 標成 false,理由同上:
  * 「某人曾經排除過這個點、理由是什麼」本身就是要留存的紀錄。
  */
 export async function syncTrialReviews(
@@ -949,52 +967,68 @@ export async function syncTrialReviews(
   signals: TrialSignal[],
 ): Promise<TrialReviewRecord[]> {
   const sql = getSql();
-  const intervalKey = key.event_interval_id ?? -1;
 
+  const serialNos: number[] = [];
   for (const signal of signals) {
+    const serialNo = toSerialNo(signal.point_id);
+    if (serialNo === null) {
+      throw new Error(
+        `疑似異常點 ${signal.point_id} 不是工件流水號,無法寫入覆核紀錄`,
+      );
+    }
+    serialNos.push(serialNo);
+  }
+
+  for (const [index, signal] of signals.entries()) {
     await sql`
-      INSERT INTO phase_i_trial_review
-        (product, process, machine, feature_name, chart_type,
-         event_interval_key, point_id, actual_value,
-         trial_violation, violated_rules, signal_sources, updated_at)
+      INSERT INTO "試算覆核"
+        ("品號", "製程", "機台", "球標尺寸名", "管制圖類型",
+         "事件紀錄id", "流水號", "實際值",
+         "試算是否異常", "違反規則", "訊號來源", "更新時間")
       VALUES
         (${key.product}, ${key.process}, ${key.machine},
          ${key.feature_name}, ${key.chart_type},
-         ${intervalKey}, ${signal.point_id}, ${signal.actual_value},
+         ${key.event_interval_id}::int, ${serialNos[index]},
+         ${signal.actual_value},
          TRUE,
          ${JSON.stringify(signal.violated_rules ?? [])}::jsonb,
          ${JSON.stringify(signal.sources ?? [])}::jsonb,
          CURRENT_TIMESTAMP)
-      ON CONFLICT (product, process, machine, feature_name, chart_type,
-                   event_interval_key, point_id)
+      ON CONFLICT ("品號", "製程", "機台", "球標尺寸名", "管制圖類型",
+                   "事件紀錄id", "流水號")
       DO UPDATE SET
-        actual_value    = EXCLUDED.actual_value,
-        trial_violation = TRUE,
-        violated_rules  = EXCLUDED.violated_rules,
-        signal_sources  = EXCLUDED.signal_sources,
-        updated_at      = CURRENT_TIMESTAMP
+        "實際值"       = EXCLUDED."實際值",
+        "試算是否異常" = TRUE,
+        "違反規則"     = EXCLUDED."違反規則",
+        "訊號來源"     = EXCLUDED."訊號來源",
+        "更新時間"     = CURRENT_TIMESTAMP
     `;
   }
 
-  const stillFlagged = signals.map((signal) => signal.point_id);
   await sql`
-    UPDATE phase_i_trial_review
-       SET trial_violation = FALSE,
-           updated_at = CURRENT_TIMESTAMP
-     WHERE product = ${key.product}
-       AND process = ${key.process}
-       AND machine = ${key.machine}
-       AND feature_name = ${key.feature_name}
-       AND chart_type = ${key.chart_type}
-       AND event_interval_key = ${intervalKey}
-       AND trial_violation = TRUE
-       AND NOT (point_id = ANY(${stillFlagged}::text[]))
+    UPDATE "試算覆核"
+       SET "試算是否異常" = FALSE,
+           "更新時間" = CURRENT_TIMESTAMP
+     WHERE "品號" = ${key.product}
+       AND "製程" = ${key.process}
+       AND "機台" = ${key.machine}
+       AND "球標尺寸名" = ${key.feature_name}
+       AND "管制圖類型" = ${key.chart_type}
+       AND "事件紀錄id" IS NOT DISTINCT FROM ${key.event_interval_id}::int
+       AND "試算是否異常" = TRUE
+       AND NOT ("流水號" = ANY(${serialNos}::int[]))
   `;
 
   return listTrialReviews(key);
 }
 
-/** 儲存既有 Phase I signal 的人工審查結果。 */
+/**
+ * 儲存既有 Phase I signal 的人工審查結果。
+ *
+ * 更新 試算覆核 與新增 試算覆核歷程 寫在同一條 SQL(data-modifying CTE),
+ * 兩者一起成功或一起失敗 —— getSql() 每次呼叫可能拿到不同連線,
+ * 拆成兩次呼叫就沒辦法包 transaction。
+ */
 export async function saveTrialReview(input: {
   key: TrialReviewKey;
   point_id: string;
@@ -1003,6 +1037,9 @@ export async function saveTrialReview(input: {
   exclusion_note: string | null;
   reviewed_by: string | null;
 }): Promise<TrialReviewRecord | null> {
+  const serialNo = toSerialNo(input.point_id);
+  if (serialNo === null) return null;
+
   const sql = getSql();
   const reason =
     input.baseline_disposition === "exclude"
@@ -1012,36 +1049,45 @@ export async function saveTrialReview(input: {
     input.baseline_disposition === "exclude"
       ? input.exclusion_note?.trim() || null
       : null;
-  const intervalKey = input.key.event_interval_id ?? -1;
 
   const rows = (await sql`
-    UPDATE phase_i_trial_review
-       SET review_status = 'reviewed',
-           baseline_disposition = ${input.baseline_disposition},
-           exclusion_reason_code = ${reason},
-           exclusion_note = ${note},
-           reviewed_by = ${input.reviewed_by?.trim() || null},
-           reviewed_at = CURRENT_TIMESTAMP,
-           updated_at = CURRENT_TIMESTAMP
-     WHERE product = ${input.key.product}
-       AND process = ${input.key.process}
-       AND machine = ${input.key.machine}
-       AND feature_name = ${input.key.feature_name}
-       AND chart_type = ${input.key.chart_type}
-       AND event_interval_key = ${intervalKey}
-       AND point_id = ${input.point_id}
-     RETURNING
-       point_id,
-       actual_value::float8 AS actual_value,
-       trial_violation,
-       violated_rules,
-       signal_sources,
-       review_status,
-       baseline_disposition,
-       exclusion_reason_code,
-       exclusion_note,
-       reviewed_by,
-       reviewed_at::text AS reviewed_at
+    WITH updated AS (
+      UPDATE "試算覆核"
+         SET "覆核狀態" = 'reviewed',
+             "基準處置" = ${input.baseline_disposition},
+             "排除原因" = ${reason},
+             "排除說明" = ${note},
+             "覆核人員" = ${input.reviewed_by?.trim() || null},
+             "覆核時間" = CURRENT_TIMESTAMP,
+             "更新時間" = CURRENT_TIMESTAMP
+       WHERE "品號" = ${input.key.product}
+         AND "製程" = ${input.key.process}
+         AND "機台" = ${input.key.machine}
+         AND "球標尺寸名" = ${input.key.feature_name}
+         AND "管制圖類型" = ${input.key.chart_type}
+         AND "事件紀錄id" IS NOT DISTINCT FROM ${input.key.event_interval_id}::int
+         AND "流水號" = ${serialNo}
+       RETURNING *
+    ),
+    logged AS (
+      INSERT INTO "試算覆核歷程"
+        ("覆核id", "基準處置", "排除原因", "排除說明", "覆核人員", "覆核時間")
+      SELECT id, "基準處置", "排除原因", "排除說明", "覆核人員", "覆核時間"
+        FROM updated
+    )
+    SELECT
+      "流水號"::text          AS point_id,
+      "實際值"::float8        AS actual_value,
+      "試算是否異常"          AS trial_violation,
+      "違反規則"              AS violated_rules,
+      "訊號來源"              AS signal_sources,
+      "覆核狀態"              AS review_status,
+      "基準處置"              AS baseline_disposition,
+      "排除原因"              AS exclusion_reason_code,
+      "排除說明"              AS exclusion_note,
+      "覆核人員"              AS reviewed_by,
+      "覆核時間"::text        AS reviewed_at
+    FROM updated
   `) as unknown as TrialReviewRow[];
 
   const row = rows[0];
