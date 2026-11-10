@@ -493,6 +493,7 @@ docker compose logs -f
 REALDB is empty; restoring /backup/REALDB_backup.dump
 REALDB restore completed
 applying migration 20261111_trial_review.sql
+applying migration 20261112_part_source_file.sql
 migrations completed
 ```
 
@@ -781,11 +782,11 @@ http://localhost:8000/review/<token>
 
 | 表 | 主鍵 | 說明 |
 | --- | --- | --- |
-| `來源檔案` | — | 已辨識過的檢查表檔案紀錄（用來擋同名檔案） |
+| `來源檔案` | — | 已辨識過的檢查表檔案紀錄（用來擋同名檔案）；一份檔案對應一筆 `工件` |
 | `品號` | — | 產品品號主檔 |
 | `製程` | — | 製程主檔 |
 | `機台` | — | 機台主檔 |
-| `工件` | `(機台, 流水號)` | 一件工件一列 |
+| `工件` | `(機台, 流水號)` | 一件工件一列；`來源檔名` → `來源檔案`（由 migration 加上，非 pipeline 匯入的工件為 NULL） |
 | `球標尺寸` | — | 尺寸規格（名義值、上下公差） |
 | `測量值` | `(機台, 流水號, 球標尺寸名)` | 實際量測值，含 `是否異常` 旗標 |
 | `事件紀錄` | `id` | 換刀／保養／參數調整等事件（`事件類型` 是自由文字） |
@@ -1168,6 +1169,11 @@ CREATE TABLE
 CREATE TABLE
 CREATE INDEX
 DO
+applying migration 20261112_part_source_file.sql
+ALTER TABLE
+DO
+CREATE INDEX
+UPDATE 0
 migrations completed
 ```
 
