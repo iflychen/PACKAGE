@@ -31,10 +31,7 @@ router = APIRouter()
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(
-    os.getenv(
-        "REVIEW_DB_PATH",
-        str(BASE_DIR / "data" / "review_tasks.db"),
-    )
+    os.getenv("REVIEW_DB_PATH", str(BASE_DIR / "data" / "review_tasks.db"))
 ).expanduser()
 
 
@@ -53,6 +50,10 @@ class ConfirmReviewRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     columns: list[Any]
     rows: list[list[Any]]
+    # keys make row/column identities stable across insert, delete, rename and reopen.
+    row_keys: list[str] = Field(default_factory=list)
+    column_keys: list[str] = Field(default_factory=list)
+    cell_evaluations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # ============================================================
@@ -60,10 +61,7 @@ class ConfirmReviewRequest(BaseModel):
 # ============================================================
 
 def get_db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
     return connection
@@ -126,12 +124,133 @@ def init_review_db() -> None:
             "corrected_rows_json":
                 "ALTER TABLE review_tasks "
                 "ADD COLUMN corrected_rows_json TEXT",
+            "corrected_row_keys_json":
+                "ALTER TABLE review_tasks "
+                "ADD COLUMN corrected_row_keys_json TEXT",
+            "corrected_column_keys_json":
+                "ALTER TABLE review_tasks "
+                "ADD COLUMN corrected_column_keys_json TEXT",
         }
 
         for column_name, sql in migrations.items():
             if column_name not in existing:
                 connection.execute(sql)
 
+        connection.executescript("""
+        CREATE TABLE IF NOT EXISTS review_cell_evaluations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_task_id INTEGER NOT NULL,
+            page_number INTEGER NOT NULL CHECK(page_number >= 1),
+            row_key TEXT NOT NULL,
+            column_name TEXT NOT NULL,
+            display_column_name TEXT NOT NULL DEFAULT '',
+            model_value TEXT,
+            corrected_value TEXT,
+            verdict TEXT NOT NULL CHECK(verdict IN
+                ('correct','incorrect','unclear','blank')),
+            reviewed_at TEXT NOT NULL,
+            FOREIGN KEY(review_task_id) REFERENCES review_tasks(id) ON DELETE CASCADE,
+            UNIQUE(review_task_id, page_number, row_key, column_name)
+        );
+        CREATE TABLE IF NOT EXISTS review_row_errors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_task_id INTEGER NOT NULL,
+            page_number INTEGER NOT NULL CHECK(page_number >= 1),
+            row_key TEXT NOT NULL,
+            error_type TEXT NOT NULL CHECK(error_type IN ('missing','extra')),
+            reviewed_at TEXT NOT NULL,
+            FOREIGN KEY(review_task_id) REFERENCES review_tasks(id) ON DELETE CASCADE,
+            UNIQUE(review_task_id, page_number, row_key, error_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cell_verdict
+            ON review_cell_evaluations(review_task_id, verdict);
+        """)
+        # Upgrade an older evaluation table whose CHECK constraint did not
+        # allow the four current labels. SQLite cannot alter a CHECK clause,
+        # so rebuild the table while copying the existing review records.
+        schema_row = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='review_cell_evaluations'"
+        ).fetchone()
+        schema_sql = str(schema_row[0] or "").lower() if schema_row else ""
+        if "'unclear'" not in schema_sql or "'blank'" not in schema_sql:
+            old_columns = {
+                str(row[1]) for row in connection.execute(
+                    "PRAGMA table_info(review_cell_evaluations)"
+                ).fetchall()
+            }
+            if old_columns:
+                def old_value(name: str, fallback: str) -> str:
+                    return f'"{name}"' if name in old_columns else fallback
+
+                id_expr = old_value("id", "NULL")
+                task_expr = old_value("review_task_id", "0")
+                page_expr = old_value("page_number", "1")
+                row_expr = old_value(
+                    "row_key",
+                    "'legacy-' || COALESCE(" + id_expr + ", rowid)",
+                )
+                col_expr = old_value("column_name", "'legacy'")
+                display_expr = old_value("display_column_name", "''")
+                model_expr = old_value("model_value", "NULL")
+                corrected_expr = old_value("corrected_value", "NULL")
+                verdict_expr = old_value("verdict", "'unclear'")
+                time_expr = old_value("reviewed_at", "CURRENT_TIMESTAMP")
+
+                connection.execute("DROP TABLE IF EXISTS review_cell_evaluations_v2")
+                connection.execute("""
+                    CREATE TABLE review_cell_evaluations_v2 (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        review_task_id INTEGER NOT NULL,
+                        page_number INTEGER NOT NULL CHECK(page_number >= 1),
+                        row_key TEXT NOT NULL,
+                        column_name TEXT NOT NULL,
+                        display_column_name TEXT NOT NULL DEFAULT '',
+                        model_value TEXT,
+                        corrected_value TEXT,
+                        verdict TEXT NOT NULL CHECK(verdict IN
+                            ('correct','incorrect','unclear','blank')),
+                        reviewed_at TEXT NOT NULL,
+                        FOREIGN KEY(review_task_id) REFERENCES review_tasks(id) ON DELETE CASCADE,
+                        UNIQUE(review_task_id, page_number, row_key, column_name)
+                    )
+                """)
+                connection.execute(f"""
+                    INSERT INTO review_cell_evaluations_v2 (
+                        id,review_task_id,page_number,row_key,column_name,
+                        display_column_name,model_value,corrected_value,verdict,reviewed_at
+                    )
+                    SELECT {id_expr},{task_expr},{page_expr},
+                        COALESCE({row_expr}, 'legacy-' || rowid),
+                        COALESCE({col_expr}, 'legacy'),
+                        COALESCE({display_expr}, ''),{model_expr},{corrected_expr},
+                        CASE lower(COALESCE({verdict_expr}, ''))
+                            WHEN 'correct' THEN 'correct'
+                            WHEN 'incorrect' THEN 'incorrect'
+                            WHEN 'wrong' THEN 'incorrect'
+                            WHEN 'unclear' THEN 'unclear'
+                            WHEN 'blank' THEN 'blank'
+                            ELSE 'unclear'
+                        END,
+                        COALESCE({time_expr}, CURRENT_TIMESTAMP)
+                    FROM review_cell_evaluations
+                """)
+                connection.execute("DROP TABLE review_cell_evaluations")
+                connection.execute(
+                    "ALTER TABLE review_cell_evaluations_v2 "
+                    "RENAME TO review_cell_evaluations"
+                )
+                connection.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_cell_verdict
+                    ON review_cell_evaluations(review_task_id, verdict)
+                """)
+        # For databases that already received the standalone SQL migration.
+        known = {str(x[1]) for x in connection.execute(
+            'PRAGMA table_info(review_cell_evaluations)').fetchall()}
+        if 'display_column_name' not in known:
+            connection.execute(
+                "ALTER TABLE review_cell_evaluations "
+                "ADD COLUMN display_column_name TEXT NOT NULL DEFAULT ''")
         connection.commit()
 
 
@@ -202,57 +321,300 @@ def get_review_task(
         ).fetchone()
 
 
+VERDICTS = {"correct", "incorrect", "unclear", "blank"}
+UNRESOLVED_VALUES = {"unknown", "unclear", "辨識失敗", "未讀到"}
+
+
+def derive_verdict(model_value: Any, corrected_value: Any) -> str:
+    """Derive the accuracy label from OCR and human-confirmed values."""
+    model_text = to_text(model_value)
+    corrected_text = to_text(corrected_value)
+    if corrected_text.lower() in UNRESOLVED_VALUES:
+        return "unclear"
+    if model_text == corrected_text:
+        return "blank" if not corrected_text else "correct"
+    return "incorrect"
+
+
+def _valid_row_keys(rows: list[list[str]], keys: list[str]) -> list[str]:
+    if not keys or len(keys) != len(rows):
+        raise HTTPException(400, "row_keys 數量與 rows 不一致")
+    if len(set(keys)) != len(keys) or not all(
+        key.startswith(("orig:", "new:")) for key in keys
+    ):
+        raise HTTPException(400, "row_keys 格式不合法或重複")
+    return keys
+
+
+def _valid_column_keys(cols: list[str], keys: list[str]) -> list[str]:
+    if not keys or len(keys) != len(cols):
+        raise HTTPException(400, "column_keys 數量與 columns 不一致")
+    if len(set(keys)) != len(keys) or not all(
+        key.startswith(("col:", "newcol:")) for key in keys
+    ):
+        raise HTTPException(400, "column_keys 格式不合法或重複")
+    return keys
+
+
+def get_review_keys(task: sqlite3.Row, row_count: int, col_count: int):
+    rows = json.loads(task["corrected_row_keys_json"] or "null")
+    cols = json.loads(task["corrected_column_keys_json"] or "null")
+    if not isinstance(rows, list) or len(rows) != row_count:
+        rows = [f"orig:{i}" for i in range(row_count)]
+    if not isinstance(cols, list) or len(cols) != col_count:
+        cols = [f"col:{i}" for i in range(col_count)]
+    return rows, cols
+
+
+def _original_value(original_rows, row_key: str, col_key: str) -> Any:
+    if not row_key.startswith("orig:") or not col_key.startswith("col:"):
+        return ""
+    try:
+        r = int(row_key[5:])
+        c = int(col_key[4:])
+        return _canonical_cell_value(original_rows[r][c])
+    except (ValueError, IndexError, TypeError):
+        raise HTTPException(400, "無效的原始 row/column key")
+
+
+def _page_no(row, columns):
+    try:
+        pos = columns.index("頁碼")
+    except ValueError:
+        return 1
+    value = to_text(row[pos])
+    try:
+        result = int(value)
+        return result if result >= 1 else 1
+    except (ValueError, IndexError):
+        return 1
+
+
 def save_confirmed_data(
     token: str,
     metadata: dict[str, str],
     columns: list[str],
     rows: list[list[str]],
-) -> None:
-    now = datetime.now().isoformat(
-        timespec="seconds"
-    )
+    row_keys: list[str],
+    column_keys: list[str],
+    cell_evaluations: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Atomically save confirmed values and human judgments; never auto-score old tasks."""
+    now = datetime.now().isoformat(timespec="seconds")
+    row_keys = _valid_row_keys(rows, row_keys)
+    column_keys = _valid_column_keys(columns, column_keys)
+    if len(set(columns)) != len(columns):
+        raise HTTPException(400, "欄位名稱不可重複，否則無法匯出到資料庫")
 
     with get_db() as connection:
-        cursor = connection.execute(
-            """
-            UPDATE review_tasks
-            SET
-                corrected_metadata_json = ?,
-                corrected_columns_json = ?,
-                corrected_rows_json = ?,
-                status = 'confirmed',
-                confirmed_at = ?
-            WHERE token = ?
-              AND status != 'confirmed'
-            """,
-            (
-                json.dumps(
-                    metadata,
-                    ensure_ascii=False,
-                ),
-                json.dumps(
-                    columns,
-                    ensure_ascii=False,
-                ),
-                json.dumps(
-                    rows,
-                    ensure_ascii=False,
-                ),
-                now,
-                token,
-            ),
+        task = connection.execute(
+            "SELECT * FROM review_tasks WHERE token = ?", (token,)
+        ).fetchone()
+        if task is None:
+            raise HTTPException(404, "找不到人工修正任務")
+        if task["status"] == "confirmed":
+            raise HTTPException(409, "檢表已確認；重新編輯後才能更新")
+
+        orig_rows = json.loads(task["original_rows_json"])
+        orig_cols = json.loads(task["columns_json"])
+        expected_orig_rows = {f"orig:{i}" for i in range(len(orig_rows))}
+        expected_orig_cols = {f"col:{i}" for i in range(len(orig_cols))}
+        if {k for k in row_keys if k.startswith("orig:")} - expected_orig_rows:
+            raise HTTPException(400, "row_keys 包含不存在的原始資料列")
+        if {k for k in column_keys if k.startswith("col:")} - expected_orig_cols:
+            raise HTTPException(400, "column_keys 包含不存在的原始欄位")
+
+        coords = {}
+        required = set()
+        for ridx, (row, row_key) in enumerate(zip(rows, row_keys)):
+            if row_key.startswith("new:"):
+                continue  # Entire missing row: exactly one row error below.
+            page = _page_no(row, columns)
+            for cidx, (name, col_key) in enumerate(zip(columns, column_keys)):
+                if name == "頁碼":
+                    continue  # page locator is not an OCR data cell
+                pair = (row_key, col_key)
+                coords[pair] = (
+                    page, name, _original_value(orig_rows, row_key, col_key),
+                    _canonical_cell_value(row[cidx])
+                )
+                required.add(pair)
+
+        # Deleting an originally detected column must not silently raise the score.
+        deleted_col_labels = []
+        removed_cols = expected_orig_cols - set(column_keys)
+        for row_key in row_keys:
+            if not row_key.startswith("orig:"):
+                continue
+            orig_row = orig_rows[int(row_key[5:])]
+            page = _page_no(orig_row, orig_cols)
+            for col_key in sorted(removed_cols):
+                col_index = int(col_key[4:])
+                original_col_name = orig_cols[col_index]
+                if original_col_name == "頁碼":
+                    continue
+                original = _original_value(orig_rows, row_key, col_key)
+                if original: # removed a nonempty original column => missed OCR cell
+                    deleted_col_labels.append(
+                        (page,row_key,col_key,original_col_name,original)
+                    )
+
+        labels = {}
+        for item in cell_evaluations:
+            rk = str(item.get("row_key", ""))
+            ck = str(item.get("column_key", ""))
+            supplied_verdict = item.get("verdict")
+            pair = (rk, ck)
+            if supplied_verdict not in VERDICTS or pair not in required or pair in labels:
+                raise HTTPException(400, f"非法、重複或無對應欄位的評價：{rk}/{ck}")
+            original = coords[pair][2]
+            corrected = coords[pair][3]
+            verdict = derive_verdict(original, corrected)
+            if supplied_verdict != verdict:
+                raise HTTPException(400, f"評價與辨識值/人工修正值不一致：{rk}/{ck}")
+            labels[pair] = verdict
+
+        missing = required - set(labels)
+        if missing:
+            raise HTTPException(400, f"還有 {len(missing)} 格未完成評價，請先標記")
+
+        for row, rk in zip(rows, row_keys):
+            if rk.startswith("new:") and not any(
+                to_text(cell) for ci, cell in enumerate(row)
+                if columns[ci] != "頁碼"
+            ):
+                raise HTTPException(400, "新增的量測資料列不能只有頁碼或完全空白")
+
+        # Replacement labels and corrected data are committed together.
+        # Pydantic/validation errors above cannot leave partial writes.
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "DELETE FROM review_cell_evaluations WHERE review_task_id=?",
+            (task["id"],),
         )
+        connection.execute(
+            "DELETE FROM review_row_errors WHERE review_task_id=?",
+            (task["id"],),
+        )
+        connection.executemany("""
+            INSERT INTO review_cell_evaluations
+              (review_task_id,page_number,row_key,column_name,display_column_name,
+               model_value,corrected_value,verdict,reviewed_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, [
+            (task["id"], coords[pair][0], pair[0], pair[1], coords[pair][1],
+             coords[pair][2], coords[pair][3], verdict, now)
+            for pair, verdict in labels.items()
+        ] + [
+            (task["id"],page,row_key,col_key,name,original,"","incorrect",now)
+            for page,row_key,col_key,name,original in deleted_col_labels
+        ])
+        row_errors = []
+        current = set(row_keys)
+        for rk in row_keys:
+            if rk.startswith("new:"):
+                i = row_keys.index(rk)
+                row_errors.append((task["id"], _page_no(rows[i], columns), rk, "missing", now))
+        for rk in sorted(expected_orig_rows - current):
+            source_row = orig_rows[int(rk[5:])]
+            row_errors.append((task["id"], _page_no(source_row, orig_cols), rk, "extra", now))
+        connection.executemany("""
+            INSERT INTO review_row_errors
+               (review_task_id,page_number,row_key,error_type,reviewed_at)
+            VALUES (?,?,?,?,?)
+        """, row_errors)
+        cursor = connection.execute("""
+            UPDATE review_tasks SET
+              corrected_metadata_json=?,corrected_columns_json=?,corrected_rows_json=?,
+              corrected_row_keys_json=?,corrected_column_keys_json=?,
+              status='confirmed',confirmed_at=?
+            WHERE id=? AND status!='confirmed'
+        """, (
+            json.dumps(metadata,ensure_ascii=False),
+            json.dumps(columns,ensure_ascii=False),
+            json.dumps(rows,ensure_ascii=False),
+            json.dumps(row_keys,ensure_ascii=False),
+            json.dumps(column_keys,ensure_ascii=False),
+            now,task["id"]
+        ))
+        if cursor.rowcount != 1:
+            raise HTTPException(409,"確認失敗：任務狀態已被更新")
+        # 人工按確認後才同步 PostgreSQL；同步失敗就不提交 SQLite 的 confirmed
+        # 狀態，讓使用者修好連線後可以重試，不會出現「畫面成功但 PG 沒資料」。
+        try:
+            from neon_db import save_confirmed_manual_review
+
+            pg_sync = save_confirmed_manual_review(
+                token=token,
+                file_name=task["file_name"],
+                metadata=metadata,
+                columns=columns,
+                original_columns=orig_cols,
+                original_rows=orig_rows,
+                corrected_rows=rows,
+                row_keys=row_keys,
+                column_keys=column_keys,
+                verdicts=labels,
+                confirmed_at=now,
+            )
+        except Exception as error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"PostgreSQL 同步失敗，人工確認尚未完成：{type(error).__name__}: {error}",
+            ) from error
 
         connection.commit()
+        return pg_sync
 
-        if cursor.rowcount == 0:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "這份檢表已經確認過，"
-                    "或資料不存在"
-                ),
-            )
+
+def get_cell_labels(task_id: int) -> dict[tuple[str, str], str]:
+    with get_db() as connection:
+        results = connection.execute("""
+            SELECT row_key,column_name,verdict FROM review_cell_evaluations
+            WHERE review_task_id=?
+        """, (task_id,)).fetchall()
+    return {(r["row_key"],r["column_name"]):r["verdict"] for r in results}
+
+
+def get_accuracy_summary(task_id: int) -> dict[str, Any]:
+    with get_db() as connection:
+        counts = {r["verdict"]:r["n"] for r in connection.execute("""
+            SELECT verdict,COUNT(*) n FROM review_cell_evaluations
+            WHERE review_task_id=? GROUP BY verdict
+        """,(task_id,)).fetchall()}
+        row_counts = {r["error_type"]:r["n"] for r in connection.execute("""
+            SELECT error_type,COUNT(*) n FROM review_row_errors
+            WHERE review_task_id=? GROUP BY error_type
+        """,(task_id,)).fetchall()}
+    correct = counts.get("correct",0)
+    incorrect = counts.get("incorrect",0)
+    unclear = counts.get("unclear",0)
+    blank = counts.get("blank",0)
+    missing = row_counts.get("missing",0)
+    extra = row_counts.get("extra",0)
+    total = correct+incorrect+missing+extra
+    with get_db() as connection:
+        by_column = connection.execute("""
+            SELECT display_column_name, verdict, COUNT(*) AS n
+            FROM review_cell_evaluations
+            WHERE review_task_id=?
+            GROUP BY display_column_name, verdict
+        """,(task_id,)).fetchall()
+    column_stats = {}
+    for rec in by_column:
+        name=rec["display_column_name"] or rec["verdict"]
+        column_stats.setdefault(name,{"correct":0,"incorrect":0,"unclear":0,"blank":0})
+        column_stats[name][rec["verdict"]] += rec["n"]
+    for values in column_stats.values():
+        subtotal=values["correct"]+values["incorrect"]
+        values["accuracy_percent"]=(round(100*values["correct"]/subtotal,2) if subtotal else None)
+    return dict(
+        correct=correct,incorrect=incorrect,unclear=unclear,blank=blank,
+        missing_rows=missing,extra_rows=extra,scored_total=total,
+        by_column=column_stats,
+        custom_accuracy_percent=round(correct*100/total,2) if total else None,
+        scoring_policy="正確/（正確+錯誤+整筆遺漏+多辨列）；空白與不清楚不入分母",
+    )
 
 
 # ============================================================
@@ -264,6 +626,17 @@ def to_text(value: Any) -> str:
         return ""
 
     return str(value).strip()
+
+
+def _canonical_cell_value(value: Any) -> Any:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "null":
+        return None
+    if text.lower() in {"unknown", "unclear"}:
+        return text.lower()
+    return text
 
 
 def normalize_metadata(
@@ -478,58 +851,50 @@ def build_metadata_html(
     )
 
 
+def _cell_state(value: Any) -> str:
+    text = to_text(value).lower()
+    if text in {"unknown", "unclear"}:
+        return text
+    if not text or text == "null":
+        return "null"
+    if text in {"✓", "✔", "☑"}:
+        return "check"
+    return "value"
+
+
 def build_table_html(
     columns: list[str],
     rows: list[list[str]],
     readonly: bool,
+    row_keys: list[str],
+    column_keys: list[str],
+    original_rows: list[list[str]],
+    cell_labels: dict[tuple[str, str], str],
 ) -> str:
-    editable = (
-        "false"
-        if readonly
-        else "true"
-    )
-
+    editable = "false" if readonly else "true"
     headers = "".join(
-        f"""
-        <th
-            class="column-header editable-cell"
-            contenteditable="{editable}"
-            data-original="{esc(column)}"
-            spellcheck="false"
-        >{esc(column)}</th>
-        """
-        for column in columns
+        f'<th class="column-header editable-cell" contenteditable="{("false" if column == "頁碼" else editable)}" '
+        f'data-column-key="{esc(col_key)}" data-original="{esc(column)}" '
+        f'spellcheck="false">{esc(column)}</th>'
+        for column, col_key in zip(columns, column_keys)
     )
-
-    body_parts: list[str] = []
-
-    for row in rows:
-        cells = "".join(
-            f"""
-            <td
-                class="data-cell editable-cell"
-                contenteditable="{editable}"
-                data-original="{esc(value)}"
-                spellcheck="false"
-            >{esc(value)}</td>
-            """
-            for value in row
-        )
-
-        body_parts.append(
-            f"<tr>{cells}</tr>"
-        )
-
-    return (
-        '<table id="reviewTable">'
-        "<thead><tr>"
-        + headers
-        + "</tr></thead>"
-        "<tbody>"
-        + "".join(body_parts)
-        + "</tbody>"
-        "</table>"
-    )
+    body_parts=[]
+    for row, row_key in zip(rows,row_keys):
+        cells=[]
+        for value, col_key in zip(row,column_keys):
+            original = _original_value(original_rows,row_key,col_key)
+            verdict = cell_labels.get((row_key,col_key),"")
+            value_state = _cell_state(value)
+            reviewed = "1" if verdict else "0"
+            cells.append(
+                f'<td class="data-cell editable-cell" contenteditable="{editable}" '
+                f'data-original="{esc(original)}" data-verdict="{esc(verdict)}" '
+                f'data-reviewed="{reviewed}" data-value-state="{value_state}" '
+                f'spellcheck="false">{esc(value)}</td>'
+            )
+        body_parts.append(f'<tr data-row-key="{esc(row_key)}">{"".join(cells)}</tr>')
+    return ('<table id="reviewTable"><thead><tr>' + headers +
+            '</tr></thead><tbody>' + ''.join(body_parts) + '</tbody></table>')
 
 
 HTML_TEMPLATE = r"""
@@ -702,9 +1067,9 @@ h1 {
     border: 1px solid #aeb7c2;
     background: #ffffff;
     color: #1f2937;
-    border-radius: 7px;
-    padding: 8px 12px;
-    font-size: 14px;
+    border-radius: 8px;
+    padding: 10px 15px;
+    font-size: 16px;
     font-weight: 800;
     cursor: pointer;
 }
@@ -731,8 +1096,8 @@ h1 {
 
 .sheet-wrap {
     width: 100%;
-    height: min(60vh, 660px);
-    min-height: 360px;
+    height: min(68vh, 760px);
+    min-height: 430px;
     overflow: auto;
     scrollbar-gutter: stable both-edges;
     overscroll-behavior: contain;
@@ -748,14 +1113,14 @@ table {
 
 th,
 td {
-    min-width: 100px;
-    height: 48px;
-    padding: 0 9px;
+    min-width: 125px;
+    height: 60px;
+    padding: 0 13px;
     text-align: center;
     vertical-align: middle;
     border-right: 1px solid #aeb7c2;
     border-bottom: 1px solid #aeb7c2;
-    font-size: 16px;
+    font-size: 19px;
     white-space: nowrap;
 }
 
@@ -763,37 +1128,20 @@ th {
     position: sticky;
     top: 0;
     z-index: 6;
-    height: 52px;
+    height: 64px;
     background: #e5eaf0;
     font-weight: 900;
 }
 
 th:nth-child(1),
 td:nth-child(1) {
-    min-width: 66px;
-}
-
-th:nth-child(2),
-td:nth-child(2) {
-    min-width: 95px;
-}
-
-th:nth-child(3),
-td:nth-child(3),
-th:nth-child(4),
-td:nth-child(4) {
-    min-width: 78px;
+    min-width: 80px;
 }
 
 th:nth-child(5),
 td:nth-child(5) {
-    min-width: 190px;
+    min-width: 240px;
     white-space: normal;
-}
-
-th:nth-child(6),
-td:nth-child(6) {
-    min-width: 100px;
 }
 
 .editable-cell {
@@ -915,6 +1263,14 @@ td:nth-child(6) {
         margin-left: 0;
     }
 }
+
+.accuracy-toolbar {display:flex; gap:8px; flex-wrap:wrap; margin:16px 0; align-items:center; padding:12px; border:1px solid #cbd5e1; border-radius:8px;}
+.data-cell[data-verdict="correct"] {box-shadow:inset 0 -3px #16a34a;}
+.data-cell[data-verdict="incorrect"] {box-shadow:inset 0 -3px #dc2626;}
+.data-cell[data-verdict="unclear"] {box-shadow:inset 0 -3px #d97706;}
+.data-cell[data-verdict="blank"] {box-shadow:inset 0 -3px #64748b;}
+.data-cell[data-value-state="unknown"], .data-cell[data-value-state="unclear"] {background:#fff2cc;}
+.data-cell[data-value-state="check"] {font-weight:900;color:#15803d;}
 </style>
 </head>
 
@@ -986,34 +1342,18 @@ td:nth-child(6) {
 
             <button
                 class="tool-btn"
-                id="addRowAboveBtn"
+                id="addRowBtn"
                 __DISABLED__
             >
-                ＋ 向上新增列
+                ＋ 新增資料列
             </button>
 
             <button
                 class="tool-btn"
-                id="addRowBelowBtn"
+                id="addColumnBtn"
                 __DISABLED__
             >
-                ＋ 向下新增列
-            </button>
-
-            <button
-                class="tool-btn"
-                id="addColumnLeftBtn"
-                __DISABLED__
-            >
-                ＋ 向左新增欄
-            </button>
-
-            <button
-                class="tool-btn"
-                id="addColumnRightBtn"
-                __DISABLED__
-            >
-                ＋ 向右新增欄
+                ＋ 新增欄位
             </button>
 
             <button
@@ -1033,11 +1373,21 @@ td:nth-child(6) {
             </button>
 
             <div class="toolbar-help">
-                先點選一個格子，再決定向上／下新增列或向左／右新增欄
+                點一下表格中的格子即可選取該列／欄
             </div>
 
         </div>
 
+        <div class="accuracy-toolbar" id="accuracyToolbar">
+          <strong>人工確認值（先點選資料格）</strong>
+          <button class="tool-btn" type="button" data-marker="unknown" __DISABLED__>unknown</button>
+          <button class="tool-btn" type="button" data-marker="unclear" __DISABLED__>unclear</button>
+          <button class="tool-btn" type="button" data-marker="null" __DISABLED__>null（確定空白）</button>
+          <button class="tool-btn" type="button" data-marker="✓" __DISABLED__>✓ 勾勾</button>
+          <button class="tool-btn" type="button" id="bulkMarkBtn" __DISABLED__>已核對：沿用未修改格</button>
+          <div id="accuracyProgress" class="toolbar-help"></div>
+          <div class="toolbar-help">可直接輸入正確數值；unknown、unclear、null 和 ✓ 會原樣保存。SQLite 同時保留 OCR 原值與人工修正值，正確率標籤由兩者比對產生。</div>
+        </div>
         <div class="sheet-wrap">
             __TABLE_HTML__
         </div>
@@ -1112,20 +1462,12 @@ const metaContainer = document.getElementById(
     "metaContainer"
 );
 
-const addRowAboveBtn = document.getElementById(
-    "addRowAboveBtn"
+const addRowBtn = document.getElementById(
+    "addRowBtn"
 );
 
-const addRowBelowBtn = document.getElementById(
-    "addRowBelowBtn"
-);
-
-const addColumnLeftBtn = document.getElementById(
-    "addColumnLeftBtn"
-);
-
-const addColumnRightBtn = document.getElementById(
-    "addColumnRightBtn"
+const addColumnBtn = document.getElementById(
+    "addColumnBtn"
 );
 
 const deleteRowBtn = document.getElementById(
@@ -1144,6 +1486,72 @@ const successBox = document.getElementById(
     "successBox"
 );
 
+const verdictToolbar = document.getElementById("accuracyToolbar");
+const progressText = document.getElementById("accuracyProgress");
+const bulkMarkBtn = document.getElementById("bulkMarkBtn");
+function makeStableId() {
+  return (window.crypto && typeof window.crypto.randomUUID === "function")
+    ? window.crypto.randomUUID()
+    : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+}
+let selectedDataCell = null;
+
+function relevantCells() {
+  const cells=[];
+  currentRows().forEach((tr)=>{
+    if (!String(tr.dataset.rowKey||"").startsWith("orig:")) return;
+    Array.from(tr.children).forEach((td,i)=>{
+      if (currentHeaders()[i]?.innerText.trim()==="頁碼") return;
+      cells.push(td);
+    });
+  });
+  return cells;
+}
+function updateAccuracyProgress() {
+  const cells = relevantCells();
+  const tagged = cells.filter(td=>td.dataset.reviewed === "1").length;
+  if (progressText) progressText.innerText = "已人工核對 " + tagged + " / " + cells.length + " 格；新增資料列另外按整筆漏辨統計";
+}
+function deriveCellVerdict(td) {
+  const original=normalizeText(td.dataset.original||"");
+  const now=normalizeText(td.innerText);
+  const normalized=now.toLowerCase();
+  if (normalized==="unknown" || normalized==="unclear") return "unclear";
+  if (normalized==="null" || normalized==="") return (!original || original.toLowerCase()==="null") ? "blank" : "incorrect";
+  return original===now ? "correct" : "incorrect";
+}
+function markCellReviewed(td) {
+  if (!td || READ_ONLY) return;
+  td.dataset.reviewed="1";
+  td.dataset.verdict=deriveCellVerdict(td);
+  const current=normalizeText(td.innerText).toLowerCase();
+  td.dataset.valueState=( ["✓","✔","☑"].includes(current) ? "check" : (current || "null") );
+  updateAccuracyProgress();
+}
+verdictToolbar.addEventListener("click",(ev)=>{
+  const btn=ev.target.closest("[data-marker]");
+  if (!btn || READ_ONLY) return;
+  if (!selectedDataCell) {alert("請先點選一個資料格");return;}
+  const colIndex=Array.from(selectedDataCell.parentElement.children).indexOf(selectedDataCell);
+  if (currentHeaders()[colIndex]?.innerText.trim()==="頁碼") {
+    alert("頁碼只是定位欄位，不能設定辨識值");return;
+  }
+  const marker=btn.dataset.marker;
+  selectedDataCell.innerText=(marker==="null" ? "" : marker);
+  selectedDataCell.dataset.explicitNull=(marker==="null" ? "1" : "0");
+  markChanged(selectedDataCell);
+  markCellReviewed(selectedDataCell);
+});
+bulkMarkBtn.addEventListener("click",()=>{
+  if (READ_ONLY) return;
+  if (!window.confirm("請確認已逐格對照原始檢表。此操作會將尚未標記的格子視為已核對，並依 OCR 原值與目前值計算評價。"))return;
+  relevantCells().forEach(td=>{
+    if (td.dataset.reviewed==="1") return;
+    td.dataset.reviewed="1";
+    td.dataset.verdict=deriveCellVerdict(td);
+  });
+  updateAccuracyProgress();
+});
 let selectedRowIndex = null;
 let selectedColumnIndex = null;
 
@@ -1528,6 +1936,7 @@ function createEditableCell() {
 
     td.contentEditable = "true";
     td.dataset.original = "";
+    td.dataset.verdict = "";
     td.spellcheck = false;
     td.innerText = "";
 
@@ -1546,6 +1955,7 @@ function createEditableHeader(name) {
 
     th.contentEditable = "true";
     th.dataset.original = "";
+    th.dataset.columnKey = "newcol:" + makeStableId();
     th.spellcheck = false;
     th.innerText = name;
 
@@ -1553,41 +1963,11 @@ function createEditableHeader(name) {
 }
 
 
-function requireSelectedRow() {
-    const rows = currentRows();
-
-    if (
-        selectedRowIndex === null
-        || !rows[selectedRowIndex]
-    ) {
-        alert(
-            "請先點一下表格中要作為基準的資料列"
-        );
-        return null;
+function addRow() {
+    if (READ_ONLY) {
+        return;
     }
 
-    return selectedRowIndex;
-}
-
-
-function requireSelectedColumn() {
-    const headers = currentHeaders();
-
-    if (
-        selectedColumnIndex === null
-        || !headers[selectedColumnIndex]
-    ) {
-        alert(
-            "請先點一下表格中要作為基準的欄位"
-        );
-        return null;
-    }
-
-    return selectedColumnIndex;
-}
-
-
-function buildEmptyRow() {
     const columnCount = (
         currentHeaders().length
     );
@@ -1595,6 +1975,7 @@ function buildEmptyRow() {
     const tr = document.createElement(
         "tr"
     );
+    tr.dataset.rowKey = "new:" + makeStableId();
 
     for (
         let i = 0;
@@ -1606,228 +1987,81 @@ function buildEmptyRow() {
         );
     }
 
-    return tr;
-}
-
-
-function addRowAbove() {
-    if (READ_ONLY) {
-        return;
-    }
-
-    const rowIndex = requireSelectedRow();
-
-    if (rowIndex === null) {
-        return;
-    }
-
-    const tbody = table.querySelector(
-        "tbody"
-    );
+    table
+        .querySelector("tbody")
+        .appendChild(tr);
 
     const rows = currentRows();
-    const newRow = buildEmptyRow();
-
-    tbody.insertBefore(
-        newRow,
-        rows[rowIndex]
-    );
 
     selectStructure(
-        rowIndex,
+        rows.length - 1,
         0
     );
 
     focusCell(
-        newRow.children[0]
+        tr.children[0]
     );
 
+    updateAccuracyProgress();
     statusText.innerText = (
-        "已在選取列上方新增資料列，尚未送出"
+        "已新增資料列，尚未送出"
     );
 }
 
 
-function addRowBelow() {
+function addColumn() {
     if (READ_ONLY) {
         return;
     }
 
-    const rowIndex = requireSelectedRow();
-
-    if (rowIndex === null) {
-        return;
-    }
-
-    const tbody = table.querySelector(
-        "tbody"
-    );
-
-    const rows = currentRows();
-    const newRow = buildEmptyRow();
-
-    const nextRow = rows[
-        rowIndex + 1
-    ];
-
-    if (nextRow) {
-        tbody.insertBefore(
-            newRow,
-            nextRow
-        );
-    } else {
-        tbody.appendChild(
-            newRow
-        );
-    }
-
-    selectStructure(
-        rowIndex + 1,
-        0
-    );
-
-    focusCell(
-        newRow.children[0]
-    );
-
-    statusText.innerText = (
-        "已在選取列下方新增資料列，尚未送出"
-    );
-}
-
-
-function askNewColumnName() {
     let name = window.prompt(
         "請輸入新欄位名稱：",
         "新欄位"
     );
 
     if (name === null) {
-        return null;
+        return;
     }
 
     name = normalizeText(name);
 
     if (!name) {
-        alert(
-            "欄位名稱不能空白"
-        );
-        return null;
+        alert("欄位名稱不能空白");
+        return;
     }
 
-    return name;
-}
-
-
-function insertColumnAt(
-    insertIndex,
-    name
-) {
     const headerRow = table.querySelector(
         "thead tr"
-    );
-
-    const headersBefore = (
-        currentHeaders()
     );
 
     const newHeader = (
         createEditableHeader(name)
     );
 
-    const headerReference = (
-        headersBefore[insertIndex]
-        || null
-    );
-
-    headerRow.insertBefore(
-        newHeader,
-        headerReference
+    headerRow.appendChild(
+        newHeader
     );
 
     currentRows().forEach((row) => {
-        const newCell = (
+        row.appendChild(
             createEditableCell()
-        );
-
-        const referenceCell = (
-            row.children[insertIndex]
-            || null
-        );
-
-        row.insertBefore(
-            newCell,
-            referenceCell
         );
     });
 
+    const newIndex = (
+        currentHeaders().length - 1
+    );
+
     selectStructure(
         null,
-        insertIndex
+        newIndex
     );
 
-    focusCell(
-        newHeader
-    );
-}
+    focusCell(newHeader);
 
-
-function addColumnLeft() {
-    if (READ_ONLY) {
-        return;
-    }
-
-    const columnIndex = (
-        requireSelectedColumn()
-    );
-
-    if (columnIndex === null) {
-        return;
-    }
-
-    const name = askNewColumnName();
-
-    if (name === null) {
-        return;
-    }
-
-    insertColumnAt(
-        columnIndex,
-        name
-    );
-
+    updateAccuracyProgress();
     statusText.innerText = (
-        "已在選取欄左側新增欄位，尚未送出"
-    );
-}
-
-
-function addColumnRight() {
-    if (READ_ONLY) {
-        return;
-    }
-
-    const columnIndex = (
-        requireSelectedColumn()
-    );
-
-    if (columnIndex === null) {
-        return;
-    }
-
-    const name = askNewColumnName();
-
-    if (name === null) {
-        return;
-    }
-
-    insertColumnAt(
-        columnIndex + 1,
-        name
-    );
-
-    statusText.innerText = (
-        "已在選取欄右側新增欄位，尚未送出"
+        "已新增欄位，尚未送出"
     );
 }
 
@@ -1863,6 +2097,8 @@ function deleteSelectedRow() {
     selectedColumnIndex = null;
     clearStructureSelection();
 
+    selectedDataCell = null;
+    updateAccuracyProgress();
     statusText.innerText = (
         "已刪除資料列，尚未送出"
     );
@@ -1899,6 +2135,10 @@ function deleteSelectedColumn() {
         ].innerText
     );
 
+    if (columnName === "頁碼") {
+      alert("頁碼是多頁 CMM 的定位欄位，不能刪除。");
+      return;
+    }
     const ok = window.confirm(
         "確定要刪除欄位「"
         + columnName
@@ -1929,6 +2169,8 @@ function deleteSelectedColumn() {
     selectedColumnIndex = null;
     clearStructureSelection();
 
+    selectedDataCell = null;
+    updateAccuracyProgress();
     statusText.innerText = (
         "已刪除欄位，尚未送出"
     );
@@ -1959,6 +2201,7 @@ table.addEventListener(
             return;
         }
 
+        selectedDataCell = cell;
         const row = cell.parentElement;
         const rows = currentRows();
 
@@ -1981,6 +2224,10 @@ document.addEventListener(
 
         if (cell) {
             markChanged(cell);
+            if (cell.tagName === "TD" && String(cell.parentElement.dataset.rowKey||"").startsWith("orig:")) {
+              cell.dataset.explicitNull="0";
+              markCellReviewed(cell);
+            }
         }
     }
 );
@@ -2131,11 +2378,12 @@ function readRows() {
             Array.from(
                 row.querySelectorAll("td")
             ).map(
-                (cell) => (
-                    normalizeText(
-                        cell.innerText
-                    )
-                )
+                (cell) => {
+                    const value=normalizeText(cell.innerText);
+                    if (value==="" || value.toLowerCase()==="null") return null;
+                    if (value.toLowerCase()==="unknown" || value.toLowerCase()==="unclear") return value.toLowerCase();
+                    return value;
+                }
             )
         )
     );
@@ -2202,6 +2450,11 @@ async function confirmData() {
         return;
     }
 
+    const missingCount = relevantCells().filter(td=>td.dataset.reviewed!=="1").length;
+    if (missingCount > 0) {
+      alert("還有 " + missingCount + " 格尚未人工核對。請逐格修改/標記，或在確認整份表單後使用批次核對。");
+      return;
+    }
     const ok = window.confirm(
         "確定整張檢表都已確認完成，"
         + "並送出嗎？"
@@ -2229,7 +2482,20 @@ async function confirmData() {
                 body: JSON.stringify({
                     metadata: readMetadata(),
                     columns: columns,
-                    rows: readRows()
+                    rows: readRows(),
+                    row_keys: currentRows().map(tr=>tr.dataset.rowKey),
+                    column_keys: currentHeaders().map(th=>th.dataset.columnKey),
+                    cell_evaluations: currentRows().flatMap(tr=>{
+                      if (!String(tr.dataset.rowKey||"").startsWith("orig:"))return [];
+                      return Array.from(tr.children).flatMap((td,i)=>{
+                        if (currentHeaders()[i].innerText.trim()==="頁碼")return [];
+                        return [{
+                          row_key: tr.dataset.rowKey,
+                          column_key: currentHeaders()[i].dataset.columnKey,
+                          verdict: td.dataset.verdict||""
+                        }];
+                      });
+                    })
                 })
             }
         );
@@ -2254,10 +2520,8 @@ async function confirmData() {
         [
             addMetaBtn,
             deleteMetaBtn,
-            addRowAboveBtn,
-            addRowBelowBtn,
-            addColumnLeftBtn,
-            addColumnRightBtn,
+            addRowBtn,
+            addColumnBtn,
             deleteRowBtn,
             deleteColumnBtn
         ].forEach((button) => {
@@ -2275,6 +2539,7 @@ async function confirmData() {
             });
 
         clearStructureSelection();
+        verdictToolbar.querySelectorAll("button").forEach(btn=>btn.disabled=true);
 
         successBox.style.display = (
             "block"
@@ -2308,24 +2573,14 @@ deleteMetaBtn.addEventListener(
     deleteSelectedMetadataField
 );
 
-addRowAboveBtn.addEventListener(
+addRowBtn.addEventListener(
     "click",
-    addRowAbove
+    addRow
 );
 
-addRowBelowBtn.addEventListener(
+addColumnBtn.addEventListener(
     "click",
-    addRowBelow
-);
-
-addColumnLeftBtn.addEventListener(
-    "click",
-    addColumnLeft
-);
-
-addColumnRightBtn.addEventListener(
-    "click",
-    addColumnRight
+    addColumn
 );
 
 deleteRowBtn.addEventListener(
@@ -2337,6 +2592,7 @@ deleteColumnBtn.addEventListener(
     "click",
     deleteSelectedColumn
 );
+updateAccuracyProgress();
 
 editBtn.addEventListener(
     "click",
@@ -2362,6 +2618,10 @@ def build_review_html(
     rows: list[list[str]],
     token: str,
     status: str,
+    row_keys: list[str],
+    column_keys: list[str],
+    original_rows: list[list[str]],
+    cell_labels: dict[tuple[str, str], str],
 ) -> str:
     readonly = (
         status == "confirmed"
@@ -2402,6 +2662,10 @@ def build_review_html(
                 columns,
                 rows,
                 readonly,
+                row_keys,
+                column_keys,
+                original_rows,
+                cell_labels,
             ),
 
         "__DISABLED__":
@@ -2549,6 +2813,9 @@ def review_page(
         get_current_review_data(task)
     )
 
+    row_keys, column_keys = get_review_keys(task,len(rows),len(columns))
+    original_rows = json.loads(task["original_rows_json"])
+    cell_labels = get_cell_labels(task["id"])
     return HTMLResponse(
         build_review_html(
             file_name=task["file_name"],
@@ -2557,6 +2824,10 @@ def review_page(
             rows=rows,
             token=token,
             status=task["status"],
+            row_keys=row_keys,
+            column_keys=column_keys,
+            original_rows=original_rows,
+            cell_labels=cell_labels,
         )
     )
 
@@ -2596,11 +2867,14 @@ def api_confirm_review(
         strict=True,
     )
 
-    save_confirmed_data(
+    pg_sync = save_confirmed_data(
         token=token,
         metadata=metadata,
         columns=columns,
         rows=rows,
+        row_keys=payload.row_keys,
+        column_keys=payload.column_keys,
+        cell_evaluations=payload.cell_evaluations,
     )
 
     return {
@@ -2610,6 +2884,8 @@ def api_confirm_review(
         "metadata": metadata,
         "columns": columns,
         "rows": rows,
+        "accuracy": get_accuracy_summary(task["id"]),
+        "postgres_sync": pg_sync,
     }
 
 
@@ -2663,6 +2939,48 @@ def api_get_review(
         "status": task["status"],
         "created_at": task["created_at"],
         "confirmed_at": task["confirmed_at"],
+        "accuracy": get_accuracy_summary(task["id"]) if task["status"] == "confirmed" else None,
+    }
+
+
+@router.get("/api/reviews/{token}/accuracy")
+def api_review_accuracy(token: str):
+    task=get_review_task(token)
+    if task is None:
+        raise HTTPException(404,"找不到這份人工確認資料")
+    if task["status"] != "confirmed":
+        raise HTTPException(409,"人工核對尚未完成，不能計算正確率")
+    return {"token":token,"file_name":task["file_name"],
+            "accuracy":get_accuracy_summary(task["id"])}
+
+
+@router.get("/api/reviews/{token}/export")
+def api_review_export(token: str) -> dict[str, Any]:
+    """Read-only confirmed JSON export; confirm route also syncs PostgreSQL."""
+    task = get_review_task(token)
+    if task is None:
+        raise HTTPException(404,"找不到人工確認任務")
+    if task["status"] != "confirmed":
+        raise HTTPException(409,"未完成人工核對，不得匯出")
+    metadata,cols,rows = get_current_review_data(task)
+    keys,columns_keys=get_review_keys(task,len(rows),len(cols))
+    with get_db() as connection:
+        labels=[dict(record) for record in connection.execute("""
+            SELECT page_number,row_key,column_name AS column_key,
+                   display_column_name,model_value,corrected_value,verdict
+            FROM review_cell_evaluations WHERE review_task_id=?
+            ORDER BY page_number,row_key,column_name
+        """,(task["id"],)).fetchall()]
+        errors=[dict(record) for record in connection.execute("""
+            SELECT page_number,row_key,error_type
+            FROM review_row_errors WHERE review_task_id=?
+        """,(task["id"],)).fetchall()]
+    return {
+        "schema_version":1,"token":token,"file_name":task["file_name"],
+        "status":task["status"],"confirmed_at":task["confirmed_at"],
+        "metadata":metadata,"columns":cols,"column_keys":columns_keys,
+        "rows":rows,"row_keys":keys,"cell_evaluations":labels,
+        "row_errors":errors,"accuracy":get_accuracy_summary(task["id"]),
     }
 
 
@@ -2710,25 +3028,191 @@ def create_demo_review(
         "11",
     ]
 
-    # 完全照 VLM rows 的輸出順序，不依編號排序。
     rows = [
-        {"編號":"1","量具編號":"eye1","代號":"D","刀號":"","檢驗標準":"該對樣品、首件或末件","公差":"","首件":"✓"},
-        {"編號":"2","量具編號":"eye1","代號":"H","刀號":"","檢驗標準":"夾持位置","公差":"","首件":"✓","1":"✓","2":"✓","3":"✓","4":"✓","5":"✓"},
-        {"編號":"3","量具編號":"eye1","代號":"F","刀號":"","檢驗標準":"擺放方式","公差":""},
-        {"編號":"4","量具編號":"eye1","代號":"H","刀號":"","檢驗標準":"外觀毛邊","公差":"","首件":"✓","1":"✓","2":"✓","3":"✓","4":"✓","5":"✓"},
-        {"編號":"5","量具編號":"M","代號":"F","刀號":"","檢驗標準":"檢驗標準","公差":""},
-        {"編號":"6","量具編號":"H","代號":"H","刀號":"","檢驗標準":"211","公差":"±0.3","首件":"10.5","1":"10.5","2":"21","3":"10.5","4":"10.5","5":"1234567890"},
-        {"編號":"10","量具編號":"M","代號":"H","刀號":"T2","檢驗標準":"ø53.975","公差":"±0.03","首件":"1397","1":"53.97","2":"3.71","3":"53.97","4":"5297","5":"8791"},
-        {"編號":"9","量具編號":"BG","代號":"H","刀號":"T6","檢驗標準":"ø47.66°","公差":"±0","首件":"0.64","1":"47.09","2":"410","3":"47.84","4":"1234567890","5":"94"},
-        {"編號":"11","量具編號":"PM","代號":"H","刀號":"T5","檢驗標準":"ø50.169","公差":"±0.1","首件":"50.17","1":"-0.17","2":"-50.8","3":"50.13","4":"0.125","5":"50.16"},
-        {"編號":"12","量具編號":"PM","代號":"H","刀號":"3","檢驗標準":"ø51.175","公差":"±0.1","首件":"50.7","1":"57.2","2":"5/2","3":"512","4":"5/0","5":"51.7"},
-        {"編號":"13","量具編號":"PF","代號":"D","刀號":"","檢驗標準":"30°","公差":"±1°","首件":"27.0"},
-        {"編號":"14","量具編號":"PF","代號":"D","刀號":"","檢驗標準":"1.295","公差":"±0.1","首件":"13"},
-        {"編號":"15","量具編號":"PF","代號":"D","刀號":"","檢驗標準":"30°","公差":"±1°","首件":"3.0"},
-        {"編號":"16","量具編號":"PF","代號":"D","刀號":"","檢驗標準":"不可有毛邊","公差":"","首件":"✓"},
-        {"編號":"17","量具編號":"PF","代號":"D","刀號":"","檢驗標準":"不可有毛邊","公差":"","首件":"✓"},
-        {"編號":"7","量具編號":"H","代號":"C","刀號":"","檢驗標準":"105","公差":"±0.1Ra(以上)"},
-        {"編號":"8","量具編號":"H","代號":"C","刀號":"","檢驗標準":"105","公差":"±Ra(以上)"},
+        {
+            "編號": "1",
+            "量具編號": "eye1",
+            "代號": "D",
+            "刀號": "",
+            "檢驗標準": "該對樣品、首件或末件",
+            "公差": "",
+            "首件": "✓",
+        },
+        {
+            "編號": "2",
+            "量具編號": "eye1",
+            "代號": "H",
+            "刀號": "",
+            "檢驗標準": "夾持位置",
+            "公差": "",
+            "首件": "✓",
+            "1": "✓",
+            "2": "✓",
+            "3": "✓",
+            "4": "✓",
+            "5": "✓",
+        },
+        {
+            "編號": "3",
+            "量具編號": "eye1",
+            "代號": "F",
+            "刀號": "",
+            "檢驗標準": "擺放方式",
+            "公差": "",
+        },
+        {
+            "編號": "4",
+            "量具編號": "eye1",
+            "代號": "H",
+            "刀號": "",
+            "檢驗標準": "外觀毛邊",
+            "公差": "",
+            "首件": "✓",
+            "1": "✓",
+            "2": "✓",
+            "3": "✓",
+            "4": "✓",
+            "5": "✓",
+        },
+        {
+            "編號": "5",
+            "量具編號": "M",
+            "代號": "F",
+            "刀號": "",
+            "檢驗標準": "檢驗標準",
+            "公差": "",
+        },
+        {
+            "編號": "6",
+            "量具編號": "H",
+            "代號": "H",
+            "刀號": "",
+            "檢驗標準": "211",
+            "公差": "±0.3",
+            "首件": "10.5",
+            "1": "10.5",
+            "2": "21",
+            "3": "10.5",
+            "4": "10.5",
+            "5": "1234567890",
+        },
+        {
+            "編號": "7",
+            "量具編號": "H",
+            "代號": "C",
+            "刀號": "",
+            "檢驗標準": "105",
+            "公差": "±0.1Ra(以上)",
+        },
+        {
+            "編號": "8",
+            "量具編號": "H",
+            "代號": "C",
+            "刀號": "",
+            "檢驗標準": "105",
+            "公差": "±Ra(以上)",
+        },
+        {
+            "編號": "9",
+            "量具編號": "BG",
+            "代號": "H",
+            "刀號": "T6",
+            "檢驗標準": "ø47.66°",
+            "公差": "±0",
+            "首件": "0.64",
+            "1": "47.09",
+            "2": "410",
+            "3": "47.84",
+            "4": "1234567890",
+            "5": "94",
+        },
+        {
+            "編號": "10",
+            "量具編號": "M",
+            "代號": "H",
+            "刀號": "T2",
+            "檢驗標準": "ø53.975",
+            "公差": "±0.03",
+            "首件": "1397",
+            "1": "53.97",
+            "2": "3.71",
+            "3": "53.97",
+            "4": "5297",
+            "5": "8791",
+        },
+        {
+            "編號": "11",
+            "量具編號": "PM",
+            "代號": "H",
+            "刀號": "T5",
+            "檢驗標準": "ø50.169",
+            "公差": "±0.1",
+            "首件": "50.17",
+            "1": "-0.17",
+            "2": "-50.8",
+            "3": "50.13",
+            "4": "0.125",
+            "5": "50.16",
+        },
+        {
+            "編號": "12",
+            "量具編號": "PM",
+            "代號": "H",
+            "刀號": "3",
+            "檢驗標準": "ø51.175",
+            "公差": "±0.1",
+            "首件": "50.7",
+            "1": "57.2",
+            "2": "5/2",
+            "3": "512",
+            "4": "5/0",
+            "5": "51.7",
+        },
+        {
+            "編號": "13",
+            "量具編號": "PF",
+            "代號": "D",
+            "刀號": "",
+            "檢驗標準": "30°",
+            "公差": "±1°",
+            "首件": "27.0",
+        },
+        {
+            "編號": "14",
+            "量具編號": "PF",
+            "代號": "D",
+            "刀號": "",
+            "檢驗標準": "1.295",
+            "公差": "±0.1",
+            "首件": "13",
+        },
+        {
+            "編號": "15",
+            "量具編號": "PF",
+            "代號": "D",
+            "刀號": "",
+            "檢驗標準": "30°",
+            "公差": "±1°",
+            "首件": "3.0",
+        },
+        {
+            "編號": "16",
+            "量具編號": "PF",
+            "代號": "D",
+            "刀號": "",
+            "檢驗標準": "不可有毛邊",
+            "公差": "",
+            "首件": "✓",
+        },
+        {
+            "編號": "17",
+            "量具編號": "PF",
+            "代號": "D",
+            "刀號": "",
+            "檢驗標準": "不可有毛邊",
+            "公差": "",
+            "首件": "✓",
+        },
     ]
 
     normalized_rows = normalize_rows(

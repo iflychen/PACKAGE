@@ -32,6 +32,7 @@ TABLE_MACHINE = "機台"
 TABLE_JOB = "工件"
 TABLE_BALL_SIZE = "球標尺寸"
 TABLE_MEASUREMENT = "測量值"
+TABLE_MANUAL_REVIEW = "aniki_manual_review_cells"
 
 
 # =========================
@@ -273,7 +274,6 @@ def validate_required_columns(
             "流水號",
             "量測時間",
             "量測人員",
-            "來源檔名",
         },
         TABLE_BALL_SIZE: {
             "品號",
@@ -476,16 +476,13 @@ def upsert_job(
     serial_number: str,
     measurement_time: Optional[datetime],
     operator: Optional[str],
-    source_file_name: str,
 ) -> None:
-    # 來源檔名 → 來源檔案(檔名)。重新匯入同一個工件時更新成最新那份檔案。
     update_query = sql.SQL(
         """
         UPDATE {}
         SET
             "量測時間" = %s,
-            "量測人員" = %s,
-            "來源檔名" = %s
+            "量測人員" = %s
         WHERE "品號" = %s
           AND "製程" = %s
           AND "機台" = %s
@@ -498,7 +495,6 @@ def upsert_job(
         (
             measurement_time,
             operator,
-            source_file_name,
             part_number,
             process_name,
             machine,
@@ -515,10 +511,9 @@ def upsert_job(
                 "機台",
                 "流水號",
                 "量測時間",
-                "量測人員",
-                "來源檔名"
+                "量測人員"
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s);
+            VALUES (%s, %s, %s, %s, %s, %s);
             """
         ).format(table_identifier(TABLE_JOB))
 
@@ -531,7 +526,6 @@ def upsert_job(
                 serial_number,
                 measurement_time,
                 operator,
-                source_file_name,
             ),
         )
 
@@ -701,12 +695,6 @@ def save_aniki_result(
     if not serial_number:
         raise ValueError("metadata 裡沒有「流水號」")
 
-    # upsert_source_file() 缺檔名會丟例外，這裡先取出來給 工件 用。
-    source_file_name = normalize_text(file_info.get("檔名"))
-
-    if not source_file_name:
-        raise ValueError("file_info 裡沒有「檔名」")
-
     measurement_time = parse_measurement_time(metadata)
     rows = list(iter_rows(final_output))
 
@@ -752,7 +740,6 @@ def save_aniki_result(
                 serial_number=serial_number,
                 measurement_time=measurement_time,
                 operator=operator,
-                source_file_name=source_file_name,
             )
             counts["工件"] = 1
 
@@ -805,6 +792,182 @@ def save_aniki_result(
 
         connection.commit()
 
+    return counts
+
+
+def save_confirmed_manual_review(
+    *,
+    token: str,
+    file_name: str,
+    metadata: Mapping[str, Any],
+    columns: list[str],
+    original_columns: list[str],
+    original_rows: list[list[Any]],
+    corrected_rows: list[list[Any]],
+    row_keys: list[str],
+    column_keys: list[str],
+    verdicts: Mapping[tuple[str, str], str],
+    confirmed_at: str,
+) -> dict[str, int]:
+    """Persist every confirmed cell, and map numeric handwritten samples to SPC tables.
+
+    The detail table keeps all columns and states losslessly. Numeric samples are
+    inserted into the existing formal measurement tables when the handwritten
+    form provides the four required identifiers: 品號、製程、機台、流水號.
+    """
+    from datetime import datetime
+
+    def col_index(*names: str) -> int | None:
+        normalized = {str(name).strip().casefold(): i for i, name in enumerate(columns)}
+        for name in names:
+            if name.casefold() in normalized:
+                return normalized[name.casefold()]
+        return None
+
+    def meta(*names: str) -> Optional[str]:
+        for name in names:
+            value = normalize_text(metadata.get(name))
+            if value:
+                return value
+        return None
+
+    part_number = meta("品號", "品号", "品番")
+    process_name = meta("製程", "工序", "製程名稱")
+    machine = meta("機台", "機器", "設備")
+    base_serial = meta("流水號", "工件號", "工件編號") or Path(file_name).stem
+    operator = meta("操作者", "量測人員", "檢查人員")
+    try:
+        measured_at = parse_measurement_time(metadata)
+    except ValueError:
+        measured_at = None
+    if measured_at is None:
+        measured_at = datetime.fromisoformat(confirmed_at)
+
+    item_col = col_index("項目", "檢查項目", "檢驗項目", "檢驗標準", "尺寸名稱")
+    number_col = col_index("編號", "序號")
+    nominal_col = col_index("名義值", "定義值", "標準值")
+    tolerance_col = col_index("公差", "上公差")
+    lower_col = col_index("下公差")
+    excluded = {i for i in (item_col, number_col, nominal_col, tolerance_col, lower_col,
+                            col_index("頁碼"), col_index("量具編號"), col_index("代號"),
+                            col_index("刀號")) if i is not None}
+    sample_cols = [
+        (i, str(name).strip()) for i, name in enumerate(columns)
+        if i not in excluded and str(name).strip().casefold() not in
+        {"檢驗標準", "公差", "單位", "備註", "檢查人員"}
+    ]
+    # Only known sample-column labels are treated as measurement values.
+    sample_cols = [(i, n) for i, n in sample_cols
+                   if n.casefold() in {"首件", "末件", "first", "last"}
+                   or n.isdigit()]
+
+    counts = {"manual_review_cells": 0, "formal_measurements": 0}
+    with psycopg.connect(get_database_url(), connect_timeout=15) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(f'''CREATE TABLE IF NOT EXISTS public."{TABLE_MANUAL_REVIEW}" (
+                task_token TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                row_key TEXT NOT NULL,
+                column_key TEXT NOT NULL,
+                page_number INTEGER NOT NULL DEFAULT 1,
+                column_name TEXT NOT NULL,
+                ocr_value TEXT,
+                corrected_value TEXT,
+                verdict TEXT NOT NULL,
+                metadata_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                confirmed_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (task_token, row_key, column_key)
+            )''')
+            cursor.execute(f'DELETE FROM public."{TABLE_MANUAL_REVIEW}" WHERE task_token=%s', (token,))
+            detail_rows = []
+            for ri, (row, row_key) in enumerate(zip(corrected_rows, row_keys)):
+                original = [None] * len(original_columns)
+                if row_key.startswith("orig:"):
+                    try:
+                        original = original_rows[int(row_key[5:])]
+                    except (ValueError, IndexError):
+                        pass
+                page = 1
+                page_i = col_index("頁碼")
+                if page_i is not None:
+                    try: page = max(1, int(row[page_i]))
+                    except (ValueError, TypeError): pass
+                for ci, (column_key, name, corrected) in enumerate(zip(column_keys, columns, row)):
+                    if name == "頁碼":
+                        continue
+                    ocr = None
+                    if row_key.startswith("orig:") and column_key.startswith("col:"):
+                        try:
+                            ocr = original[int(column_key[4:])]
+                        except (ValueError, IndexError):
+                            pass
+                    detail_rows.append((token, file_name, row_key, column_key, page, name,
+                                        None if ocr is None else str(ocr),
+                                        None if corrected is None else str(corrected),
+                                        verdicts.get((row_key, column_key), "unclear"),
+                                        json.dumps(dict(metadata), ensure_ascii=False), confirmed_at))
+            if detail_rows:
+                cursor.executemany(f'''INSERT INTO public."{TABLE_MANUAL_REVIEW}"
+                    (task_token,file_name,row_key,column_key,page_number,column_name,
+                     ocr_value,corrected_value,verdict,metadata_json,confirmed_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s)''', detail_rows)
+            counts["manual_review_cells"] = len(detail_rows)
+
+            # Only publish measurements when identity columns exist; status tokens
+            # and non-numeric text stay in the review-detail table above.
+            if all((part_number, process_name, machine, base_serial)) and item_col is not None:
+                validate_required_columns(cursor)
+                upsert_part(cursor, part_number)
+                upsert_process(cursor, part_number, process_name)
+                upsert_machine(cursor, machine)
+                for ri, (row, row_key) in enumerate(zip(corrected_rows, row_keys)):
+                    item_label = normalize_text(row[item_col])
+                    if not item_label:
+                        continue
+                    number = normalize_text(row[number_col]) if number_col is not None else None
+                    item_name = f"{number}-{item_label}" if number else item_label
+                    nominal = None
+                    if nominal_col is not None:
+                        try: nominal = to_decimal(row[nominal_col])
+                        except ValueError: pass
+                    if nominal is None:
+                        nominal_match = re.search(r"[-+]?\d+(?:\.\d+)?", item_label.replace(",", ""))
+                        if nominal_match:
+                            try: nominal = Decimal(nominal_match.group(0))
+                            except InvalidOperation: pass
+                    upper = lower = None
+                    if tolerance_col is not None:
+                        tol_text = normalize_text(row[tolerance_col])
+                        if tol_text:
+                            match = re.search(r"\d+(?:\.\d+)?", tol_text)
+                            if match:
+                                try:
+                                    tol = abs(Decimal(match.group(0)))
+                                    upper, lower = tol, -tol
+                                except (ValueError, TypeError): pass
+                    if lower_col is not None:
+                        try:
+                            explicit_lower = to_decimal(row[lower_col])
+                            if explicit_lower is not None: lower = explicit_lower
+                        except ValueError: pass
+                    upsert_ball_size(cursor, part_number, process_name, item_name, upper, lower, nominal)
+                    for ci, sample_name in sample_cols:
+                        if ci >= len(row):
+                            continue
+                        try:
+                            actual = to_decimal(row[ci])
+                        except ValueError:
+                            continue
+                        if actual is None:
+                            continue
+                        serial = f"{base_serial}-{sample_name}"
+                        upsert_job(cursor, part_number, process_name, machine, serial, measured_at, operator)
+                        deviation = actual - nominal if nominal is not None else None
+                        abnormal, abnormal_type = judge_abnormal(deviation, upper, lower)
+                        upsert_measurement(cursor, part_number, process_name, machine, serial,
+                                           item_name, actual, abnormal, abnormal_type)
+                        counts["formal_measurements"] += 1
+        connection.commit()
     return counts
 
 
