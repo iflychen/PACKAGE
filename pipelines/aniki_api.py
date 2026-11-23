@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
-from app import router as review_router
+from app import create_review_task, router as review_router
 import psycopg
 from dotenv import load_dotenv
 from fastapi import (
@@ -25,6 +25,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 
 from neon_db import get_database_url
+from review_payload import make_review_payload
 
 try:
     import pymupdf
@@ -743,6 +744,48 @@ def _process_single_report(
                 status_code=500,
                 content=response,
             )
+
+        # Every successfully parsed upload gets an editable review task. The
+        # browser-facing link is rendered by the Open WebUI Pipe, which uses
+        # ANIKI_REVIEW_BASE_URL because this API is called from another container.
+        try:
+            review_payload = make_review_payload(
+                file_name=original_name,
+                metadata=summary["metadata"],
+                pages=summary["pages"],
+            )
+            review_token = create_review_task(
+                file_name=review_payload["file_name"],
+                metadata=review_payload["metadata"],
+                columns=review_payload["columns"],
+                rows=review_payload["rows"],
+            )
+        except Exception as error:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "辨識完成，但建立人工修正任務失敗："
+                    f"{type(error).__name__}: {error}"
+                ),
+            ) from error
+
+        unresolved_markers = {
+            "unknown", "unclear", "辨識失敗", "未讀到"
+        }
+        pending_review_count = sum(
+            1
+            for value in [
+                *review_payload["metadata"].values(),
+                *(cell for row in review_payload["rows"] for cell in row),
+            ]
+            if str(value or "").strip().lower() in unresolved_markers
+        )
+        response.update({
+            "review_token": review_token,
+            "review_path": f"/review/{review_token}",
+            "review_pending_count": pending_review_count,
+            "review_status": "pending_review",
+        })
 
         if neon_success:
             # 只快取真正寫入資料庫的結果；寫入失敗時重送同一檔案要重新處理。

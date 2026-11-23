@@ -28,11 +28,11 @@ MANIFEST = {
     "title": MODEL_NAME,
     "author": "Local",
     "description": (
-        "上傳 CMM PDF 或圖片並送出後，自動辨識並寫入本地 PostgreSQL。"
+        "上傳檢查表後自動辨識、建立人工修正頁並回傳連結。"
     ),
     "required_open_webui_version": "0.9.0",
     "requirements": "requests",
-    "version": "1.3.0",
+    "version": "1.3.1",
     "license": "MIT",
 }
 

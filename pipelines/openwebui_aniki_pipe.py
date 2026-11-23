@@ -1,10 +1,10 @@
 """
 title: Aniki
 author: Local
-description: 上傳 CMM PDF 或圖片並送出後，自動辨識並寫入本地 PostgreSQL。
+description: 上傳檢查表後自動辨識、建立人工修正頁並回傳連結。
 required_open_webui_version: 0.9.0
 requirements: requests
-version: 1.3.0
+version: 1.3.1
 license: MIT
 """
 
@@ -37,6 +37,13 @@ class Pipe:
             ),
             description="必須與專案根目錄 .env 的 ANIKI_API_KEY 相同",
         )
+        REVIEW_BASE_URL: str = Field(
+            default=os.getenv(
+                "ANIKI_REVIEW_BASE_URL",
+                "http://localhost:8000",
+            ),
+            description="瀏覽器可連線的 Pipelines 網址；預設為 http://localhost:8000",
+        )
         TIMEOUT_SECONDS: int = Field(
             default=7200,
             description="等待 Aniki 完成的最長秒數",
@@ -49,6 +56,15 @@ class Pipe:
     def __init__(self):
         self.valves = self.Valves()
         self._pending_replacements: dict[str, list[dict]] = {}
+
+    @staticmethod
+    def _review_link_url(base_url: str, review_path: Optional[str]) -> Optional[str]:
+        path = str(review_path or "").strip()
+        if not path:
+            return None
+        if path.startswith(("http://", "https://")):
+            return path
+        return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
     @staticmethod
     def _latest_user_text(body: dict) -> str:
@@ -592,6 +608,16 @@ class Pipe:
                 metadata = payload.get("metadata") or {}
                 row_count = payload.get("row_count", 0)
                 page_numbers = payload.get("page_numbers") or []
+                review_url = self._review_link_url(
+                    self.valves.REVIEW_BASE_URL,
+                    payload.get("review_path"),
+                )
+                review_line = (
+                    f"### [開啟人工修正表格]({review_url})"
+                    if review_url
+                    else "⚠️ 後端未回傳人工修正連結"
+                )
+                pending = payload.get("review_pending_count", 0)
 
                 if payload.get("neon_success") is False:
                     reason = payload.get("neon_error") or "資料庫寫入失敗"
@@ -599,6 +625,8 @@ class Pipe:
                         "\n".join(
                             [
                                 f"❌ **{filename}** 辨識完成，但未寫入資料庫",
+                                review_line,
+                                f"- 待修正：{pending} 格",
                                 f"- 原因：{reason}",
                                 f"- 品號：{metadata.get('品號') or '未讀到'}",
                                 f"- 製程：{metadata.get('製程') or '未讀到'}",
@@ -614,7 +642,7 @@ class Pipe:
                             {
                                 "type": "status",
                                 "data": {
-                                    "description": f"{filename} 未寫入資料庫",
+                                    "description": f"{filename} 已建立人工修正頁；資料庫寫入失敗",
                                     "done": True,
                                 },
                             }
@@ -622,16 +650,18 @@ class Pipe:
                     continue
 
                 completion_text = (
-                    "已完成辨識並取代資料庫中的舊資料"
+                    "已完成辨識並取代資料庫中的舊資料，請人工覆核"
                     if payload.get("replaced_existing")
                     or replacing_existing
                     or confirmed
-                    else "已完成辨識並寫入資料庫"
+                    else "已完成辨識並寫入資料庫，請人工覆核"
                 )
                 results.append(
                     "\n".join(
                         [
                             f"✅ **{filename}** {completion_text}",
+                            review_line,
+                            f"- 待修正：{pending} 格",
                             f"- 品號：{metadata.get('品號') or '未讀到'}",
                             f"- 製程：{metadata.get('製程') or '未讀到'}",
                             f"- 機台：{metadata.get('機台') or '未讀到'}",
@@ -647,7 +677,7 @@ class Pipe:
                         {
                             "type": "status",
                             "data": {
-                                "description": f"{filename} 已寫入資料庫",
+                                "description": f"{filename} 辨識完成，請開啟人工修正表格",
                                 "done": True,
                             },
                         }
